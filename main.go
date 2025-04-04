@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -11,54 +12,64 @@ import (
 	"github.com/cilium/ebpf/link"
 )
 
-const (
-	TYPE_ENTER = 1
-	TYPE_DROP  = 2
-	TYPE_PASS  = 3
-)
-
 func main() {
+	// Загрузка eBPF программы
 	spec, err := ebpf.LoadCollectionSpec("xdp_block.o")
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to load spec: %v", err))
 	}
 
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to create new collection: %v\n", err))
+		panic(fmt.Sprintf("Failed to create collection: %v", err))
 	}
 	defer coll.Close()
 
-	// Записываем индекс интерфейса в карту
-	ifaceName := "wlp3s0" // Укажите нужный интерфейс
-	targetIface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		panic(fmt.Sprintf("Interface %s not found: %v", ifaceName, err))
+	// Получаем карту для блокировки IP
+	blockedIPs := coll.Maps["blocked_ips"]
+	if blockedIPs == nil {
+		panic("blocked_ips map not found")
 	}
 
-	blockedMap := coll.Maps["blocked_iface_map"]
+	// Записываем IP для блокировки
+	ipToBlock := net.ParseIP("1.1.1.1").To4()
+	if ipToBlock == nil {
+		panic("invalid IP address")
+	}
+
+	// Конвертируем IP в be32 (network byte order)
+	var ipBytes [4]byte
+	copy(ipBytes[:], ipToBlock)
+	ipValue := binary.BigEndian.Uint32(ipBytes[:])
+
 	key := uint32(0)
-	value := uint32(targetIface.Index)
-	if err := blockedMap.Put(key, value); err != nil {
+	if err := blockedIPs.Put(key, ipValue); err != nil {
 		panic(fmt.Sprintf("Failed to update map: %v", err))
 	}
 
 	// Прикрепляем XDP программу
-	opts := link.XDPOptions{
-		Program:   coll.Programs["xdp_dilih"],
-		Interface: targetIface.Index,
+	ifaceName := "wlp3s0"
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		panic(fmt.Sprintf("Interface %s not found: %v", ifaceName, err))
 	}
+
+	opts := link.XDPOptions{
+		Program:   coll.Programs["xdp_block_ip"],
+		Interface: iface.Index,
+	}
+
 	lnk, err := link.AttachXDP(opts)
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to attach XDP: %v", err))
 	}
 	defer lnk.Close()
 
-	fmt.Printf("Blocking all traffic on interface %s (index %d)\n", 
-		targetIface.Name, targetIface.Index)
+	fmt.Printf("Blocking traffic for IP: %s on interface %s\n", 
+		ipToBlock.String(), ifaceName)
 
 	// Ожидание сигнала
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
 }
