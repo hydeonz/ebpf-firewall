@@ -26,7 +26,6 @@ var (
 )
 
 func main() {
-	// Загрузка eBPF программы
 	spec, err := ebpf.LoadCollectionSpec("bpf/xdp_block.o")
 	if err != nil {
 		log.Fatalf("Failed to load spec: %v", err)
@@ -43,7 +42,6 @@ func main() {
 		log.Fatal("blocked_ips map not found")
 	}
 
-	// Настройка HTTP сервера
 	http.HandleFunc("/block", handleBlockRequest)
 	http.HandleFunc("/unblock", handleUnblockRequest)
 
@@ -54,7 +52,6 @@ func main() {
 		}
 	}()
 
-	// Ожидание сигнала для выхода
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
@@ -78,31 +75,26 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Парсинг IP
 	ip := net.ParseIP(ipToBlock).To4()
 	if ip == nil {
 		http.Error(w, "Invalid IP address", http.StatusBadRequest)
 		return
 	}
 
-	// Конвертация IP в network byte order
 	var ipBytes [4]byte
 	copy(ipBytes[:], ip)
 	ipValue := binary.BigEndian.Uint32(ipBytes[:])
 
-	// Обновление карты eBPF
 	key := uint32(0)
 	if err := blockedIPs.Put(key, ipValue); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to update map: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Если уже прикреплено к другому интерфейсу, закрываем предыдущую ссылку
 	if currentLink != nil {
 		currentLink.Close()
 	}
 
-	// Прикрепление XDP программы к интерфейсу
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Interface %s not found: %v", ifaceName, err), http.StatusBadRequest)
@@ -135,7 +127,6 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		currentLink = nil
 	}
 
-	// Очищаем карту блокировки
 	key := uint32(0)
 	if err := blockedIPs.Delete(key); err != nil && !os.IsNotExist(err) {
 		http.Error(w, fmt.Sprintf("Failed to clear blocked IP: %v", err), http.StatusInternalServerError)

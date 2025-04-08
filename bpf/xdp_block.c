@@ -31,9 +31,13 @@ int xdp_block_ip(struct xdp_md *ctx) {
     __u32 key = 0;
     __be32 *blocked_ip = bpf_map_lookup_elem(&blocked_ips, &key);
 
-    // Отладочная информация о каждом пакете
     bpf_printk("Packet received: src=%pI4 dst=%pI4 proto=%d",
                &ip->saddr, &ip->daddr, ip->protocol);
+    bpf_printk("blocked_ip1: %pI4", blocked_ip);
+    bpf_printk("saddr1: %pI4", ip->saddr);
+
+    bpf_printk("daddr1: %pI4", ip->daddr);
+    bpf_printk("daddr2: %pI4", &ip->daddr);
 
     if (!blocked_ip) {
         bpf_printk("No IP blocked, passing packet");
