@@ -36,7 +36,7 @@ int xdp_block_ip(struct xdp_md *ctx) {
     struct iphdr *ip = data + sizeof(*eth);
     if (data + sizeof(*eth) + sizeof(*ip) > data_end)
         return XDP_PASS;
-
+    bpf_printk("Source IP: %pI4", &ip->saddr);
     // Проверяем исходящий трафик (по source IP)
     __u8 *src_blocked = bpf_map_lookup_elem(&blocked_src, &ip->saddr);
     if (src_blocked) {
@@ -45,6 +45,7 @@ int xdp_block_ip(struct xdp_md *ctx) {
     }
 
     // Проверяем входящий трафик (по destination IP)
+    bpf_printk("Destination IP: %pI4", &ip->daddr);
     __u8 *dst_blocked = bpf_map_lookup_elem(&blocked_dst, &ip->daddr);
     if (dst_blocked) {
         bpf_printk("BLOCKED INCOMING: Destination IP %pI4", &ip->daddr);
