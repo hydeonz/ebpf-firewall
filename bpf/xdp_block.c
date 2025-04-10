@@ -10,17 +10,18 @@
 
 #define MAX_BLOCKED_IPS 256
 
-// Структура для ключа в карте - IP + протокол
-struct ip_proto_key {
+struct rule_key {
     __be32 ip;
-    __u8 proto;  // IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP и т.д.
+    __u8 proto;
+    __u8 direction; // 0 = src, 1 = dst
+    __u16 pad;     // для выравнивания
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_BLOCKED_IPS * 3);  // Умножаем на 3 (ICMP, TCP, UDP)
-    __type(key, struct ip_proto_key);
-    __type(value, __u8);  // Флаг
+    __uint(max_entries, MAX_BLOCKED_IPS * 10);
+    __type(key, struct rule_key);
+    __type(value, __u8);
 } blocked_rules SEC(".maps");
 
 SEC("xdp")
@@ -39,19 +40,29 @@ int xdp_block_ip(struct xdp_md *ctx) {
     if (data + sizeof(*eth) + sizeof(*ip) > data_end)
         return XDP_PASS;
 
-    // Проверяем блокировку для исходного IP (исходящий трафик)
-    struct ip_proto_key src_key = {.ip = ip->saddr, .proto = ip->protocol};
-    __u8 *src_blocked = bpf_map_lookup_elem(&blocked_rules, &src_key);
-    if (src_blocked) {
-        bpf_printk("BLOCKED OUTGOING: Src IP %pI4 Proto %d", &ip->saddr, ip->protocol);
+    // Проверка для исходящего трафика (direction=0)
+    struct rule_key src_key = {
+        .ip = ip->saddr,
+        .proto = ip->protocol,
+        .direction = 0,
+        .pad = 0
+    };
+
+    // Проверка для входящего трафика (direction=1)
+    struct rule_key dst_key = {
+        .ip = ip->daddr,
+        .proto = ip->protocol,
+        .direction = 1,
+        .pad = 0
+    };
+
+    if (bpf_map_lookup_elem(&blocked_rules, &src_key)) {
+        bpf_printk("BLOCKED OUTGOING: Src %pI4 Proto %d", &ip->saddr, ip->protocol);
         return XDP_DROP;
     }
 
-    // Проверяем блокировку для IP назначения (входящий трафик)
-    struct ip_proto_key dst_key = {.ip = ip->daddr, .proto = ip->protocol};
-    __u8 *dst_blocked = bpf_map_lookup_elem(&blocked_rules, &dst_key);
-    if (dst_blocked) {
-        bpf_printk("BLOCKED INCOMING: Dst IP %pI4 Proto %d", &ip->daddr, ip->protocol);
+    if (bpf_map_lookup_elem(&blocked_rules, &dst_key)) {
+        bpf_printk("BLOCKED INCOMING: Dst %pI4 Proto %d", &ip->daddr, ip->protocol);
         return XDP_DROP;
     }
 

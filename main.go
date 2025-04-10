@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 
 	"github.com/cilium/ebpf"
@@ -23,8 +22,10 @@ type BlockRequest struct {
 }
 
 type RuleKey struct {
-	IP    uint32
-	Proto uint8
+	IP        uint32 `ebpf:"ip"`
+	Proto     uint8  `ebpf:"proto"`
+	Direction uint8  `ebpf:"direction"`
+	Pad       uint16 `ebpf:"pad"`
 }
 
 var (
@@ -109,9 +110,18 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 	copy(ipBytes[:], ip)
 	ipValue := binary.BigEndian.Uint32(ipBytes[:])
 
+	var dirNum uint8
+	if direction == "src" {
+		dirNum = 0
+	} else {
+		dirNum = 1
+	}
+
 	key := RuleKey{
-		IP:    ipValue,
-		Proto: protoNum,
+		IP:        ipValue,
+		Proto:     protoNum,
+		Direction: dirNum,
+		Pad:       0,
 	}
 
 	if err := blockedRules.Put(key, uint8(1)); err != nil {
@@ -179,9 +189,18 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 	copy(ipBytes[:], ip)
 	ipValue := binary.BigEndian.Uint32(ipBytes[:])
 
+	var dirNum uint8
+	if direction == "src" {
+		dirNum = 0
+	} else {
+		dirNum = 1
+	}
+
 	key := RuleKey{
-		IP:    ipValue,
-		Proto: protoNum,
+		IP:        ipValue,
+		Proto:     protoNum,
+		Direction: dirNum,
+		Pad:       0,
 	}
 
 	if err := blockedRules.Delete(key); err != nil {
@@ -200,14 +219,18 @@ func handleListRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintln(w, "Blocked rules:")
-	iter := blockedRules.Iterate()
 	var key RuleKey
 	var value uint8
+	iter := blockedRules.Iterate()
 	for iter.Next(&key, &value) {
 		ip := make(net.IP, 4)
 		binary.BigEndian.PutUint32(ip, key.IP)
 		protoName := numberToProtocol(key.Proto)
-		fmt.Fprintf(w, "- IP: %s, Protocol: %s\n", ip, protoName)
+		dirName := "src"
+		if key.Direction == 1 {
+			dirName = "dst"
+		}
+		fmt.Fprintf(w, "- IP: %s, Protocol: %s, Direction: %s\n", ip, protoName, dirName)
 	}
 }
 
@@ -237,6 +260,6 @@ func numberToProtocol(num uint8) string {
 	case 0:
 		return "all"
 	default:
-		return strconv.Itoa(int(num))
+		return fmt.Sprintf("%d", num)
 	}
 }
