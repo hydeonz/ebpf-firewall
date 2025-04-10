@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/cilium/ebpf"
@@ -17,14 +18,19 @@ import (
 type BlockRequest struct {
 	Interface string `json:"interface"`
 	IP        string `json:"ip"`
+	Protocol  string `json:"protocol"`  // "icmp", "tcp", "udp", "all"
 	Direction string `json:"direction"` // "src" или "dst"
+}
+
+type RuleKey struct {
+	IP    uint32
+	Proto uint8
 }
 
 var (
 	coll         *ebpf.Collection
-	blockedSrc   *ebpf.Map
-	blockedDst   *ebpf.Map
-	currentLinks map[string]link.Link // Храним ссылки для каждого интерфейса
+	blockedRules *ebpf.Map
+	currentLinks map[string]link.Link
 )
 
 func main() {
@@ -41,10 +47,9 @@ func main() {
 	}
 	defer coll.Close()
 
-	blockedSrc = coll.Maps["blocked_src"]
-	blockedDst = coll.Maps["blocked_dst"]
-	if blockedSrc == nil || blockedDst == nil {
-		log.Fatal("Required maps not found in BPF program")
+	blockedRules = coll.Maps["blocked_rules"]
+	if blockedRules == nil {
+		log.Fatal("blocked_rules map not found in BPF program")
 	}
 
 	http.HandleFunc("/block", handleBlockRequest)
@@ -75,10 +80,11 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 
 	ifaceName := r.FormValue("interface")
 	ipToBlock := r.FormValue("ip")
+	protocol := r.FormValue("protocol")
 	direction := r.FormValue("direction")
 
-	if ifaceName == "" || ipToBlock == "" || direction == "" {
-		http.Error(w, "interface, ip and direction parameters are required", http.StatusBadRequest)
+	if ifaceName == "" || ipToBlock == "" || protocol == "" || direction == "" {
+		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
 	}
 
@@ -93,25 +99,26 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	protoNum, err := protocolToNumber(protocol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	var ipBytes [4]byte
 	copy(ipBytes[:], ip)
 	ipValue := binary.BigEndian.Uint32(ipBytes[:])
 
-	// Выбираем карту в зависимости от направления
-	var targetMap *ebpf.Map
-	if direction == "src" {
-		targetMap = blockedSrc
-	} else {
-		targetMap = blockedDst
+	key := RuleKey{
+		IP:    ipValue,
+		Proto: protoNum,
 	}
 
-	// Добавляем IP в соответствующую карту
-	if err := targetMap.Put(ipValue, uint8(1)); err != nil {
+	if err := blockedRules.Put(key, uint8(1)); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to update map: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Прикрепляем XDP программу, если еще не сделано
 	if _, exists := currentLinks[ifaceName]; !exists {
 		iface, err := net.InterfaceByName(ifaceName)
 		if err != nil {
@@ -132,7 +139,8 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		currentLinks[ifaceName] = lnk
 	}
 
-	fmt.Fprintf(w, "Successfully blocked %s traffic for IP: %s on interface %s\n", direction, ip, ifaceName)
+	fmt.Fprintf(w, "Successfully blocked %s %s traffic for IP: %s on interface %s\n",
+		direction, protocol, ip, ifaceName)
 }
 
 func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
@@ -142,10 +150,11 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ipToUnblock := r.FormValue("ip")
+	protocol := r.FormValue("protocol")
 	direction := r.FormValue("direction")
 
-	if ipToUnblock == "" || direction == "" {
-		http.Error(w, "ip and direction parameters are required", http.StatusBadRequest)
+	if ipToUnblock == "" || protocol == "" || direction == "" {
+		http.Error(w, "ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
 	}
 
@@ -160,23 +169,28 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	protoNum, err := protocolToNumber(protocol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	var ipBytes [4]byte
 	copy(ipBytes[:], ip)
 	ipValue := binary.BigEndian.Uint32(ipBytes[:])
 
-	var targetMap *ebpf.Map
-	if direction == "src" {
-		targetMap = blockedSrc
-	} else {
-		targetMap = blockedDst
+	key := RuleKey{
+		IP:    ipValue,
+		Proto: protoNum,
 	}
 
-	if err := targetMap.Delete(ipValue); err != nil {
+	if err := blockedRules.Delete(key); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to unblock IP: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Fprintf(w, "Successfully unblocked %s traffic for IP: %s\n", direction, ip)
+	fmt.Fprintf(w, "Successfully unblocked %s %s traffic for IP: %s\n",
+		direction, protocol, ip)
 }
 
 func handleListRequest(w http.ResponseWriter, r *http.Request) {
@@ -185,21 +199,44 @@ func handleListRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintln(w, "Blocked source IPs (outgoing traffic):")
-	iter := blockedSrc.Iterate()
-	var key uint32
+	fmt.Fprintln(w, "Blocked rules:")
+	iter := blockedRules.Iterate()
+	var key RuleKey
 	var value uint8
 	for iter.Next(&key, &value) {
 		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, key)
-		fmt.Fprintf(w, "- %s\n", ip)
+		binary.BigEndian.PutUint32(ip, key.IP)
+		protoName := numberToProtocol(key.Proto)
+		fmt.Fprintf(w, "- IP: %s, Protocol: %s\n", ip, protoName)
 	}
+}
 
-	fmt.Fprintln(w, "\nBlocked destination IPs (incoming traffic):")
-	iter = blockedDst.Iterate()
-	for iter.Next(&key, &value) {
-		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, key)
-		fmt.Fprintf(w, "- %s\n", ip)
+func protocolToNumber(protocol string) (uint8, error) {
+	switch protocol {
+	case "icmp":
+		return 1, nil
+	case "tcp":
+		return 6, nil
+	case "udp":
+		return 17, nil
+	case "all":
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("invalid protocol, must be icmp, tcp, udp or all")
+	}
+}
+
+func numberToProtocol(num uint8) string {
+	switch num {
+	case 1:
+		return "icmp"
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	case 0:
+		return "all"
+	default:
+		return strconv.Itoa(int(num))
 	}
 }
