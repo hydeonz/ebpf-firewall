@@ -17,15 +17,19 @@ import (
 type BlockRequest struct {
 	Interface string `json:"interface"`
 	IP        string `json:"ip"`
+	Direction string `json:"direction"` // "src" или "dst"
 }
 
 var (
-	coll        *ebpf.Collection
-	blockedIPs  *ebpf.Map
-	currentLink link.Link
+	coll         *ebpf.Collection
+	blockedSrc   *ebpf.Map
+	blockedDst   *ebpf.Map
+	currentLinks map[string]link.Link // Храним ссылки для каждого интерфейса
 )
 
 func main() {
+	currentLinks = make(map[string]link.Link)
+
 	spec, err := ebpf.LoadCollectionSpec("bpf/xdp_block.o")
 	if err != nil {
 		log.Fatalf("Failed to load spec: %v", err)
@@ -37,13 +41,15 @@ func main() {
 	}
 	defer coll.Close()
 
-	blockedIPs = coll.Maps["blocked_ips"]
-	if blockedIPs == nil {
-		log.Fatal("blocked_ips map not found")
+	blockedSrc = coll.Maps["blocked_src"]
+	blockedDst = coll.Maps["blocked_dst"]
+	if blockedSrc == nil || blockedDst == nil {
+		log.Fatal("Required maps not found in BPF program")
 	}
 
 	http.HandleFunc("/block", handleBlockRequest)
 	http.HandleFunc("/unblock", handleUnblockRequest)
+	http.HandleFunc("/list", handleListRequest)
 
 	go func() {
 		log.Println("Starting server on :8080")
@@ -56,8 +62,8 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 
-	if currentLink != nil {
-		currentLink.Close()
+	for _, lnk := range currentLinks {
+		lnk.Close()
 	}
 }
 
@@ -69,15 +75,21 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 
 	ifaceName := r.FormValue("interface")
 	ipToBlock := r.FormValue("ip")
+	direction := r.FormValue("direction")
 
-	if ifaceName == "" || ipToBlock == "" {
-		http.Error(w, "Both interface and ip parameters are required", http.StatusBadRequest)
+	if ifaceName == "" || ipToBlock == "" || direction == "" {
+		http.Error(w, "interface, ip and direction parameters are required", http.StatusBadRequest)
+		return
+	}
+
+	if direction != "src" && direction != "dst" {
+		http.Error(w, "direction must be either 'src' or 'dst'", http.StatusBadRequest)
 		return
 	}
 
 	ip := net.ParseIP(ipToBlock).To4()
 	if ip == nil {
-		http.Error(w, "Invalid IP address", http.StatusBadRequest)
+		http.Error(w, "Invalid IPv4 address", http.StatusBadRequest)
 		return
 	}
 
@@ -85,35 +97,42 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 	copy(ipBytes[:], ip)
 	ipValue := binary.BigEndian.Uint32(ipBytes[:])
 
-	key := uint32(0)
-	if err := blockedIPs.Put(key, ipValue); err != nil {
+	// Выбираем карту в зависимости от направления
+	var targetMap *ebpf.Map
+	if direction == "src" {
+		targetMap = blockedSrc
+	} else {
+		targetMap = blockedDst
+	}
+
+	// Добавляем IP в соответствующую карту
+	if err := targetMap.Put(ipValue, uint8(1)); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to update map: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	if currentLink != nil {
-		currentLink.Close()
+	// Прикрепляем XDP программу, если еще не сделано
+	if _, exists := currentLinks[ifaceName]; !exists {
+		iface, err := net.InterfaceByName(ifaceName)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Interface %s not found: %v", ifaceName, err), http.StatusBadRequest)
+			return
+		}
+
+		opts := link.XDPOptions{
+			Program:   coll.Programs["xdp_block_ip"],
+			Interface: iface.Index,
+		}
+
+		lnk, err := link.AttachXDP(opts)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to attach XDP: %v", err), http.StatusInternalServerError)
+			return
+		}
+		currentLinks[ifaceName] = lnk
 	}
 
-	iface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Interface %s not found: %v", ifaceName, err), http.StatusBadRequest)
-		return
-	}
-
-	opts := link.XDPOptions{
-		Program:   coll.Programs["xdp_block_ip"],
-		Interface: iface.Index,
-	}
-
-	lnk, err := link.AttachXDP(opts)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to attach XDP: %v", err), http.StatusInternalServerError)
-		return
-	}
-	currentLink = lnk
-
-	fmt.Fprintf(w, "Successfully blocking traffic for IP: %s on interface %s\n", ip, ifaceName)
+	fmt.Fprintf(w, "Successfully blocked %s traffic for IP: %s on interface %s\n", direction, ip, ifaceName)
 }
 
 func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
@@ -122,16 +141,65 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if currentLink != nil {
-		currentLink.Close()
-		currentLink = nil
-	}
+	ipToUnblock := r.FormValue("ip")
+	direction := r.FormValue("direction")
 
-	key := uint32(0)
-	if err := blockedIPs.Delete(key); err != nil && !os.IsNotExist(err) {
-		http.Error(w, fmt.Sprintf("Failed to clear blocked IP: %v", err), http.StatusInternalServerError)
+	if ipToUnblock == "" || direction == "" {
+		http.Error(w, "ip and direction parameters are required", http.StatusBadRequest)
 		return
 	}
 
-	fmt.Fprintf(w, "Successfully unblocked all traffic and detached XDP program\n")
+	if direction != "src" && direction != "dst" {
+		http.Error(w, "direction must be either 'src' or 'dst'", http.StatusBadRequest)
+		return
+	}
+
+	ip := net.ParseIP(ipToUnblock).To4()
+	if ip == nil {
+		http.Error(w, "Invalid IPv4 address", http.StatusBadRequest)
+		return
+	}
+
+	var ipBytes [4]byte
+	copy(ipBytes[:], ip)
+	ipValue := binary.BigEndian.Uint32(ipBytes[:])
+
+	var targetMap *ebpf.Map
+	if direction == "src" {
+		targetMap = blockedSrc
+	} else {
+		targetMap = blockedDst
+	}
+
+	if err := targetMap.Delete(ipValue); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to unblock IP: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "Successfully unblocked %s traffic for IP: %s\n", direction, ip)
+}
+
+func handleListRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	fmt.Fprintln(w, "Blocked source IPs (outgoing traffic):")
+	iter := blockedSrc.Iterate()
+	var key uint32
+	var value uint8
+	for iter.Next(&key, &value) {
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, key)
+		fmt.Fprintf(w, "- %s\n", ip)
+	}
+
+	fmt.Fprintln(w, "\nBlocked destination IPs (incoming traffic):")
+	iter = blockedDst.Iterate()
+	for iter.Next(&key, &value) {
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, key)
+		fmt.Fprintf(w, "- %s\n", ip)
+	}
 }
