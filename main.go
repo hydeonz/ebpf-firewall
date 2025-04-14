@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -21,13 +22,14 @@ type BlockRequest struct {
 	IP        string `json:"ip"`
 	Protocol  string `json:"protocol"`  // "icmp", "tcp", "udp", "all"
 	Direction string `json:"direction"` // "src" или "dst"
+	Port      string `json:"port"`      // номер порта или "any"
 }
 
 type RuleKey struct {
 	IP        uint32 `json:"ip"`
 	Proto     uint8  `json:"proto"`
 	Direction uint8  `json:"direction"`
-	Pad       uint16 `json:"pad"`
+	Port      uint16 `json:"port"` // 0 означает любой порт
 }
 
 type SavedRule struct {
@@ -35,6 +37,7 @@ type SavedRule struct {
 	IP        string `json:"ip"`
 	Protocol  string `json:"protocol"`
 	Direction string `json:"direction"`
+	Port      string `json:"port"`
 }
 
 var (
@@ -104,11 +107,17 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		IP:        r.FormValue("ip"),
 		Protocol:  r.FormValue("protocol"),
 		Direction: r.FormValue("direction"),
+		Port:      r.FormValue("port"),
 	}
 
 	if br.Interface == "" || br.IP == "" || br.Protocol == "" || br.Direction == "" {
 		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
+	}
+
+	// Если порт не указан, используем "any"
+	if br.Port == "" {
+		br.Port = "any"
 	}
 
 	rule := SavedRule(br)
@@ -123,8 +132,8 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "Successfully blocked %s %s traffic for IP: %s on interface %s\n",
-		rule.Direction, rule.Protocol, rule.IP, rule.Interface)
+	fmt.Fprintf(w, "Successfully blocked %s %s traffic for IP: %s, port: %s on interface %s\n",
+		rule.Direction, rule.Protocol, rule.IP, rule.Port, rule.Interface)
 }
 
 func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
@@ -138,11 +147,17 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		IP:        r.FormValue("ip"),
 		Protocol:  r.FormValue("protocol"),
 		Direction: r.FormValue("direction"),
+		Port:      r.FormValue("port"),
 	}
 
 	if br.Interface == "" || br.IP == "" || br.Protocol == "" || br.Direction == "" {
 		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
+	}
+
+	// Если порт не указан, используем "any"
+	if br.Port == "" {
+		br.Port = "any"
 	}
 
 	ip := net.ParseIP(br.IP).To4()
@@ -157,10 +172,16 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	portNum, err := portToNumber(br.Port)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	dirNum := directionToNumber(br.Direction)
 	ipVal := binary.BigEndian.Uint32(ip)
 
-	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum}
+	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
 
 	if err := blockedRules.Delete(key); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to unblock IP: %v", err), http.StatusInternalServerError)
@@ -172,7 +193,9 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		newRules := make([]SavedRule, 0)
 		for _, rule := range rules {
-			if rule.IP == br.IP && rule.Protocol == br.Protocol && rule.Direction == br.Direction && rule.Interface == br.Interface {
+			if rule.IP == br.IP && rule.Protocol == br.Protocol &&
+				rule.Direction == br.Direction && rule.Interface == br.Interface &&
+				rule.Port == br.Port {
 				continue
 			}
 			newRules = append(newRules, rule)
@@ -181,7 +204,8 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	rulesMutex.Unlock()
 
-	fmt.Fprintf(w, "Successfully unblocked %s %s traffic for IP: %s\n", br.Direction, br.Protocol, br.IP)
+	fmt.Fprintf(w, "Successfully unblocked %s %s traffic for IP: %s, port: %s\n",
+		br.Direction, br.Protocol, br.IP, br.Port)
 }
 
 func handleListRequest(w http.ResponseWriter, r *http.Request) {
@@ -203,8 +227,8 @@ func handleListRequest(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintln(w, "Blocked rules:")
 	for _, rule := range rules {
-		fmt.Fprintf(w, "- Interface: %s, IP: %s, Protocol: %s, Direction: %s\n",
-			rule.Interface, rule.IP, rule.Protocol, rule.Direction)
+		fmt.Fprintf(w, "- Interface: %s, IP: %s, Protocol: %s, Direction: %s, Port: %s\n",
+			rule.Interface, rule.IP, rule.Protocol, rule.Direction, rule.Port)
 	}
 }
 
@@ -219,10 +243,15 @@ func applyRule(rule SavedRule) error {
 		return err
 	}
 
+	portNum, err := portToNumber(rule.Port)
+	if err != nil {
+		return err
+	}
+
 	dirNum := directionToNumber(rule.Direction)
 	ipVal := binary.BigEndian.Uint32(ip)
 
-	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum}
+	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
 
 	if err := blockedRules.Put(key, uint8(1)); err != nil {
 		return fmt.Errorf("failed to insert into BPF map: %v", err)
@@ -267,6 +296,17 @@ func protocolToNumber(protocol string) (uint8, error) {
 	default:
 		return 0, fmt.Errorf("invalid protocol, must be icmp, tcp, udp or all")
 	}
+}
+
+func portToNumber(port string) (uint16, error) {
+	if port == "any" {
+		return 0, nil
+	}
+	p, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port number: %s", port)
+	}
+	return uint16(p), nil
 }
 
 func numberToProtocol(num uint8) string {
@@ -321,12 +361,15 @@ func saveRulesToFile() error {
 			IP:        ip.String(),
 			Protocol:  numberToProtocol(key.Proto),
 			Direction: "src",
+			Port:      "any",
 		}
 		if key.Direction == 1 {
 			rule.Direction = "dst"
 		}
+		if key.Port != 0 {
+			rule.Port = strconv.Itoa(int(key.Port))
+		}
 
-		// Восстанавливаем интерфейс из текущих XDP связей (возможно не идеально, но лучше чем ничего)
 		for ifaceName := range currentLinks {
 			rule.Interface = ifaceName
 			break

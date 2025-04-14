@@ -1,8 +1,16 @@
 [
   {
     "interface": "wlp3s0",
+    "ip": "34.2.168.192",
+    "protocol": "tcp",
+    "direction": "src",
+    "port": "3000"
+  },
+  {
+    "interface": "wlp3s0",
     "ip": "8.8.8.8",
     "protocol": "icmp",
-    "direction": "src"
+    "direction": "src",
+    "port": "any"
   }
 ]
