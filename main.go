@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/cilium/ebpf"
@@ -22,21 +24,28 @@ type BlockRequest struct {
 }
 
 type RuleKey struct {
-	IP        uint32 `ebpf:"ip"`
-	Proto     uint8  `ebpf:"proto"`
-	Direction uint8  `ebpf:"direction"`
-	Pad       uint16 `ebpf:"pad"`
+	IP        uint32 `json:"ip"`
+	Proto     uint8  `json:"proto"`
+	Direction uint8  `json:"direction"`
+	Pad       uint16 `json:"pad"`
+}
+
+type SavedRule struct {
+	Interface string `json:"interface"`
+	IP        string `json:"ip"`
+	Protocol  string `json:"protocol"`
+	Direction string `json:"direction"`
 }
 
 var (
 	coll         *ebpf.Collection
 	blockedRules *ebpf.Map
-	currentLinks map[string]link.Link
+	currentLinks = make(map[string]link.Link)
+	rulesFile    = "rules.json"
+	rulesMutex   sync.Mutex
 )
 
 func main() {
-	currentLinks = make(map[string]link.Link)
-
 	spec, err := ebpf.LoadCollectionSpec("bpf/xdp_block.o")
 	if err != nil {
 		log.Fatalf("Failed to load spec: %v", err)
@@ -51,6 +60,17 @@ func main() {
 	blockedRules = coll.Maps["blocked_rules"]
 	if blockedRules == nil {
 		log.Fatal("blocked_rules map not found in BPF program")
+	}
+
+	rules, err := loadRulesFromFile()
+	if err != nil {
+		log.Printf("Warning: could not load rules from file: %v", err)
+	}
+
+	for _, rule := range rules {
+		if err := applyRule(rule); err != nil {
+			log.Printf("Failed to apply rule: %v", err)
+		}
 	}
 
 	http.HandleFunc("/block", handleBlockRequest)
@@ -79,78 +99,32 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ifaceName := r.FormValue("interface")
-	ipToBlock := r.FormValue("ip")
-	protocol := r.FormValue("protocol")
-	direction := r.FormValue("direction")
+	br := BlockRequest{
+		Interface: r.FormValue("interface"),
+		IP:        r.FormValue("ip"),
+		Protocol:  r.FormValue("protocol"),
+		Direction: r.FormValue("direction"),
+	}
 
-	if ifaceName == "" || ipToBlock == "" || protocol == "" || direction == "" {
+	if br.Interface == "" || br.IP == "" || br.Protocol == "" || br.Direction == "" {
 		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
 	}
 
-	if direction != "src" && direction != "dst" {
-		http.Error(w, "direction must be either 'src' or 'dst'", http.StatusBadRequest)
+	rule := SavedRule(br)
+
+	if err := applyRule(rule); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to apply rule: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	ip := net.ParseIP(ipToBlock).To4()
-	if ip == nil {
-		http.Error(w, "Invalid IPv4 address", http.StatusBadRequest)
+	if err := saveRulesToFile(); err != nil {
+		http.Error(w, fmt.Sprintf("Rule applied but failed to save: %v", err), http.StatusInternalServerError)
 		return
-	}
-
-	protoNum, err := protocolToNumber(protocol)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	var ipBytes [4]byte
-	copy(ipBytes[:], ip)
-	ipValue := binary.BigEndian.Uint32(ipBytes[:])
-
-	var dirNum uint8
-	if direction == "src" {
-		dirNum = 0
-	} else {
-		dirNum = 1
-	}
-
-	key := RuleKey{
-		IP:        ipValue,
-		Proto:     protoNum,
-		Direction: dirNum,
-		Pad:       0,
-	}
-
-	if err := blockedRules.Put(key, uint8(1)); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to update map: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if _, exists := currentLinks[ifaceName]; !exists {
-		iface, err := net.InterfaceByName(ifaceName)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Interface %s not found: %v", ifaceName, err), http.StatusBadRequest)
-			return
-		}
-
-		opts := link.XDPOptions{
-			Program:   coll.Programs["xdp_block_ip"],
-			Interface: iface.Index,
-		}
-
-		lnk, err := link.AttachXDP(opts)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to attach XDP: %v", err), http.StatusInternalServerError)
-			return
-		}
-		currentLinks[ifaceName] = lnk
 	}
 
 	fmt.Fprintf(w, "Successfully blocked %s %s traffic for IP: %s on interface %s\n",
-		direction, protocol, ip, ifaceName)
+		rule.Direction, rule.Protocol, rule.IP, rule.Interface)
 }
 
 func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
@@ -159,57 +133,55 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ipToUnblock := r.FormValue("ip")
-	protocol := r.FormValue("protocol")
-	direction := r.FormValue("direction")
+	br := BlockRequest{
+		Interface: r.FormValue("interface"),
+		IP:        r.FormValue("ip"),
+		Protocol:  r.FormValue("protocol"),
+		Direction: r.FormValue("direction"),
+	}
 
-	if ipToUnblock == "" || protocol == "" || direction == "" {
-		http.Error(w, "ip, protocol and direction parameters are required", http.StatusBadRequest)
+	if br.Interface == "" || br.IP == "" || br.Protocol == "" || br.Direction == "" {
+		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
 	}
 
-	if direction != "src" && direction != "dst" {
-		http.Error(w, "direction must be either 'src' or 'dst'", http.StatusBadRequest)
-		return
-	}
-
-	ip := net.ParseIP(ipToUnblock).To4()
+	ip := net.ParseIP(br.IP).To4()
 	if ip == nil {
 		http.Error(w, "Invalid IPv4 address", http.StatusBadRequest)
 		return
 	}
 
-	protoNum, err := protocolToNumber(protocol)
+	protoNum, err := protocolToNumber(br.Protocol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	var ipBytes [4]byte
-	copy(ipBytes[:], ip)
-	ipValue := binary.BigEndian.Uint32(ipBytes[:])
+	dirNum := directionToNumber(br.Direction)
+	ipVal := binary.BigEndian.Uint32(ip)
 
-	var dirNum uint8
-	if direction == "src" {
-		dirNum = 0
-	} else {
-		dirNum = 1
-	}
-
-	key := RuleKey{
-		IP:        ipValue,
-		Proto:     protoNum,
-		Direction: dirNum,
-		Pad:       0,
-	}
+	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum}
 
 	if err := blockedRules.Delete(key); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to unblock IP: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Fprintf(w, "Successfully unblocked %s %s traffic for IP: %s\n",
-		direction, protocol, ip)
+	rulesMutex.Lock()
+	rules, err := loadRulesFromFile()
+	if err == nil {
+		newRules := make([]SavedRule, 0)
+		for _, rule := range rules {
+			if rule.IP == br.IP && rule.Protocol == br.Protocol && rule.Direction == br.Direction && rule.Interface == br.Interface {
+				continue
+			}
+			newRules = append(newRules, rule)
+		}
+		writeRulesToFile(newRules)
+	}
+	rulesMutex.Unlock()
+
+	fmt.Fprintf(w, "Successfully unblocked %s %s traffic for IP: %s\n", br.Direction, br.Protocol, br.IP)
 }
 
 func handleListRequest(w http.ResponseWriter, r *http.Request) {
@@ -218,20 +190,68 @@ func handleListRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintln(w, "Blocked rules:")
-	var key RuleKey
-	var value uint8
-	iter := blockedRules.Iterate()
-	for iter.Next(&key, &value) {
-		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, key.IP)
-		protoName := numberToProtocol(key.Proto)
-		dirName := "src"
-		if key.Direction == 1 {
-			dirName = "dst"
-		}
-		fmt.Fprintf(w, "- IP: %s, Protocol: %s, Direction: %s\n", ip, protoName, dirName)
+	rules, err := loadRulesFromFile()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to load rules: %v", err), http.StatusInternalServerError)
+		return
 	}
+
+	if len(rules) == 0 {
+		fmt.Fprintln(w, "No blocked rules")
+		return
+	}
+
+	fmt.Fprintln(w, "Blocked rules:")
+	for _, rule := range rules {
+		fmt.Fprintf(w, "- Interface: %s, IP: %s, Protocol: %s, Direction: %s\n",
+			rule.Interface, rule.IP, rule.Protocol, rule.Direction)
+	}
+}
+
+func applyRule(rule SavedRule) error {
+	ip := net.ParseIP(rule.IP).To4()
+	if ip == nil {
+		return fmt.Errorf("invalid IP: %s", rule.IP)
+	}
+
+	protoNum, err := protocolToNumber(rule.Protocol)
+	if err != nil {
+		return err
+	}
+
+	dirNum := directionToNumber(rule.Direction)
+	ipVal := binary.BigEndian.Uint32(ip)
+
+	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum}
+
+	if err := blockedRules.Put(key, uint8(1)); err != nil {
+		return fmt.Errorf("failed to insert into BPF map: %v", err)
+	}
+
+	if _, exists := currentLinks[rule.Interface]; !exists {
+		iface, err := net.InterfaceByName(rule.Interface)
+		if err != nil {
+			return fmt.Errorf("interface not found: %s", rule.Interface)
+		}
+		opts := link.XDPOptions{
+			Program:   coll.Programs["xdp_block_ip"],
+			Interface: iface.Index,
+		}
+		lnk, err := link.AttachXDP(opts)
+		if err != nil {
+			return fmt.Errorf("failed to attach XDP: %v", err)
+		}
+		currentLinks[rule.Interface] = lnk
+	}
+
+	return nil
+}
+
+func directionToNumber(direction string) uint8 {
+	if direction == "src" {
+		return 0
+	}
+	return 1
 }
 
 func protocolToNumber(protocol string) (uint8, error) {
@@ -262,4 +282,76 @@ func numberToProtocol(num uint8) string {
 	default:
 		return fmt.Sprintf("%d", num)
 	}
+}
+
+func loadRulesFromFile() ([]SavedRule, error) {
+	rulesMutex.Lock()
+	defer rulesMutex.Unlock()
+
+	if _, err := os.Stat(rulesFile); os.IsNotExist(err) {
+		return nil, nil
+	}
+
+	data, err := os.ReadFile(rulesFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rules file: %v", err)
+	}
+
+	var rules []SavedRule
+	if err := json.Unmarshal(data, &rules); err != nil {
+		return nil, fmt.Errorf("failed to parse rules: %v", err)
+	}
+
+	return rules, nil
+}
+
+func saveRulesToFile() error {
+	rulesMutex.Lock()
+	defer rulesMutex.Unlock()
+
+	var rules []SavedRule
+	iter := blockedRules.Iterate()
+	var key RuleKey
+	var value uint8
+
+	for iter.Next(&key, &value) {
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, key.IP)
+		rule := SavedRule{
+			IP:        ip.String(),
+			Protocol:  numberToProtocol(key.Proto),
+			Direction: "src",
+		}
+		if key.Direction == 1 {
+			rule.Direction = "dst"
+		}
+
+		// Восстанавливаем интерфейс из текущих XDP связей (возможно не идеально, но лучше чем ничего)
+		for ifaceName := range currentLinks {
+			rule.Interface = ifaceName
+			break
+		}
+
+		rules = append(rules, rule)
+	}
+
+	return writeRulesToFile(rules)
+}
+
+func writeRulesToFile(rules []SavedRule) error {
+	data, err := json.MarshalIndent(rules, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal rules: %v", err)
+	}
+
+	tmpFile := rulesFile + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temp rules file: %v", err)
+	}
+
+	if err := os.Rename(tmpFile, rulesFile); err != nil {
+		return fmt.Errorf("failed to rename temp file: %v", err)
+	}
+
+	return nil
 }

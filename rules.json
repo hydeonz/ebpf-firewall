@@ -1,0 +1,8 @@
+[
+  {
+    "interface": "wlp3s0",
+    "ip": "8.8.8.8",
+    "protocol": "icmp",
+    "direction": "src"
+  }
+]
