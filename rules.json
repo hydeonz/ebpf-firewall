@@ -1,10 +1,24 @@
 [
   {
     "interface": "wlp3s0",
-    "ip": "34.2.168.192",
+    "ip": "77.88.55.242",
+    "protocol": "icmp",
+    "direction": "src",
+    "port": "any"
+  },
+  {
+    "interface": "wlp3s0",
+    "ip": "1.1.1.1",
+    "protocol": "icmp",
+    "direction": "src",
+    "port": "any"
+  },
+  {
+    "interface": "wlp3s0",
+    "ip": "1.1.1.1",
     "protocol": "tcp",
     "direction": "src",
-    "port": "3000"
+    "port": "any"
   },
   {
     "interface": "wlp3s0",
@@ -12,5 +26,19 @@
     "protocol": "icmp",
     "direction": "src",
     "port": "any"
+  },
+  {
+    "interface": "wlp3s0",
+    "ip": "77.88.44.242",
+    "protocol": "icmp",
+    "direction": "src",
+    "port": "any"
+  },
+  {
+    "interface": "wlp3s0",
+    "ip": "192.168.2.33",
+    "protocol": "tcp",
+    "direction": "src",
+    "port": "3000"
   }
 ]

@@ -15,10 +15,10 @@
 #define IPPROTO_UDP 17
 
 struct rule_key {
-    __be32 ip;
+    __le32 ip;
     __u8 proto;
     __u8 direction; // 0 = src, 1 = dst
-    __u16 port;    // Добавляем поле для порта (0 означает любое значение порта)
+    __u16 port;    // 0 означает любое значение порта
 };
 
 struct {
@@ -59,9 +59,13 @@ int xdp_block_ip(struct xdp_md *ctx) {
         }
     }
 
+    // Преобразуем IP-адреса из сетевого порядка в host порядок
+    __be32 saddr = ip->saddr;
+    __be32 daddr = ip->daddr;
+
     // Проверяем правила для исходного адреса
     struct rule_key src_key = {
-        .ip = ip->saddr,
+        .ip = saddr,
         .proto = ip->protocol,
         .direction = 0,
         .port = 0 // Проверка без учета порта
@@ -69,7 +73,7 @@ int xdp_block_ip(struct xdp_md *ctx) {
 
     // Проверяем правила для адреса назначения
     struct rule_key dst_key = {
-        .ip = ip->daddr,
+        .ip = daddr,
         .proto = ip->protocol,
         .direction = 1,
         .port = 0 // Проверка без учета порта
@@ -77,14 +81,14 @@ int xdp_block_ip(struct xdp_md *ctx) {
 
     // Проверяем правила с учетом портов (если они есть в пакете)
     struct rule_key src_port_key = {
-        .ip = ip->saddr,
+        .ip = saddr,
         .proto = ip->protocol,
         .direction = 0,
         .port = src_port
     };
 
     struct rule_key dst_port_key = {
-        .ip = ip->daddr,
+        .ip = daddr,
         .proto = ip->protocol,
         .direction = 1,
         .port = dst_port
@@ -92,23 +96,23 @@ int xdp_block_ip(struct xdp_md *ctx) {
 
     // Сначала проверяем правила с конкретными портами
     if (bpf_map_lookup_elem(&blocked_rules, &src_port_key)) {
-        bpf_printk("BLOCKED OUTGOING: Src %pI4:%d Proto %d", &ip->saddr, src_port, ip->protocol);
+        bpf_printk("BLOCKED OUTGOING: Src %pI4:%d Proto %d", &saddr, src_port, ip->protocol);
         return XDP_DROP;
     }
 
     if (bpf_map_lookup_elem(&blocked_rules, &dst_port_key)) {
-        bpf_printk("BLOCKED INCOMING: Dst %pI4:%d Proto %d", &ip->daddr, dst_port, ip->protocol);
+        bpf_printk("BLOCKED INCOMING: Dst %pI4:%d Proto %d", &daddr, dst_port, ip->protocol);
         return XDP_DROP;
     }
 
     // Затем проверяем общие правила без учета портов
     if (bpf_map_lookup_elem(&blocked_rules, &src_key)) {
-        bpf_printk("BLOCKED OUTGOING: Src %pI4 Proto %d", &ip->saddr, ip->protocol);
+        bpf_printk("BLOCKED OUTGOING: Src %pI4 Proto %d", &saddr, ip->protocol);
         return XDP_DROP;
     }
 
     if (bpf_map_lookup_elem(&blocked_rules, &dst_key)) {
-        bpf_printk("BLOCKED INCOMING: Dst %pI4 Proto %d", &ip->daddr, ip->protocol);
+        bpf_printk("BLOCKED INCOMING: Dst %pI4 Proto %d", &daddr, ip->protocol);
         return XDP_DROP;
     }
 
