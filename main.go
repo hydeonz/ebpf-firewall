@@ -28,18 +28,21 @@ const (
 	ProtocolTCP    = "tcp"
 	ProtocolUDP    = "udp"
 	ProtocolAll    = "all"
+	ActionBlock    = "block"
+	ActionAllow    = "allow"
 	HTTPMethodPost = http.MethodPost
 	HTTPMethodGet  = http.MethodGet
 )
 
 // Types
 type (
-	BlockRequest struct {
+	RuleRequest struct {
 		Interface string `json:"interface"`
 		IP        string `json:"ip"`
 		Protocol  string `json:"protocol"`  // "icmp", "tcp", "udp", "all"
 		Direction string `json:"direction"` // "src" или "dst"
 		Port      string `json:"port"`      // номер порта или "any"
+		Action    string `json:"action"`    // "block" или "allow"
 	}
 
 	RuleKey struct {
@@ -55,11 +58,13 @@ type (
 		Protocol  string `json:"protocol"`
 		Direction string `json:"direction"`
 		Port      string `json:"port"`
+		Action    string `json:"action"`
 	}
 
 	Firewall struct {
 		collection   *ebpf.Collection
 		blockedRules *ebpf.Map
+		allowedRules *ebpf.Map
 		currentLinks map[string]link.Link
 		rulesMutex   sync.Mutex
 	}
@@ -92,7 +97,7 @@ func main() {
 
 // NewFirewall creates and initializes a new Firewall instance
 func NewFirewall() (*Firewall, error) {
-	spec, err := ebpf.LoadCollectionSpec("bpf/xdp_block.o")
+	spec, err := ebpf.LoadCollectionSpec("bpf/xdp_block.o") // Обновленное имя файла
 	if err != nil {
 		return nil, fmt.Errorf("failed to load spec: %v", err)
 	}
@@ -108,9 +113,16 @@ func NewFirewall() (*Firewall, error) {
 		return nil, fmt.Errorf("blocked_rules map not found in BPF program")
 	}
 
+	allowedRules := coll.Maps["allowed_rules"]
+	if allowedRules == nil {
+		coll.Close()
+		return nil, fmt.Errorf("allowed_rules map not found in BPF program")
+	}
+
 	return &Firewall{
 		collection:   coll,
 		blockedRules: blockedRules,
+		allowedRules: allowedRules,
 		currentLinks: make(map[string]link.Link),
 	}, nil
 }
@@ -161,7 +173,18 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 
 	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
 
-	if err := fw.blockedRules.Put(key, uint8(1)); err != nil {
+	// Выбираем карту в зависимости от действия
+	var targetMap *ebpf.Map
+	switch rule.Action {
+	case ActionBlock:
+		targetMap = fw.blockedRules
+	case ActionAllow:
+		targetMap = fw.allowedRules
+	default:
+		return fmt.Errorf("invalid action: %s", rule.Action)
+	}
+
+	if err := targetMap.Put(key, uint8(1)); err != nil {
 		return fmt.Errorf("failed to insert into BPF map: %v", err)
 	}
 
@@ -171,7 +194,7 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 			return fmt.Errorf("interface not found: %s", rule.Interface)
 		}
 		opts := link.XDPOptions{
-			Program:   fw.collection.Programs["xdp_block_ip"],
+			Program:   fw.collection.Programs["xdp_filter_ip"], // Обновленное имя программы
 			Interface: iface.Index,
 		}
 		lnk, err := link.AttachXDP(opts)
@@ -185,29 +208,34 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 }
 
 // RemoveRule removes a firewall rule
-func (fw *Firewall) RemoveRule(br BlockRequest) error {
-	ip := net.ParseIP(br.IP).To4()
+func (fw *Firewall) RemoveRule(rr RuleRequest) error {
+	ip := net.ParseIP(rr.IP).To4()
 	if ip == nil {
 		return fmt.Errorf("invalid IPv4 address")
 	}
 
-	protoNum, err := protocolToNumber(br.Protocol)
+	protoNum, err := protocolToNumber(rr.Protocol)
 	if err != nil {
 		return err
 	}
 
-	portNum, err := portToNumber(br.Port)
+	portNum, err := portToNumber(rr.Port)
 	if err != nil {
 		return err
 	}
 
-	dirNum := directionToNumber(br.Direction)
+	dirNum := directionToNumber(rr.Direction)
 	ipVal := binary.LittleEndian.Uint32(ip)
 
 	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
 
-	if err := fw.blockedRules.Delete(key); err != nil {
-		return fmt.Errorf("failed to unblock IP: %v", err)
+	// Пытаемся удалить из обеих карт
+	if err := fw.blockedRules.Delete(key); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove from blocked rules: %v", err)
+	}
+
+	if err := fw.allowedRules.Delete(key); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove from allowed rules: %v", err)
 	}
 
 	return nil
@@ -241,6 +269,8 @@ func (fw *Firewall) saveRulesToFile() error {
 	defer fw.rulesMutex.Unlock()
 
 	var rules []SavedRule
+
+	// Собираем блокирующие правила
 	iter := fw.blockedRules.Iterate()
 	var key RuleKey
 	var value uint8
@@ -253,6 +283,34 @@ func (fw *Firewall) saveRulesToFile() error {
 			Protocol:  numberToProtocol(key.Proto),
 			Direction: DirectionSrc,
 			Port:      AnyPort,
+			Action:    ActionBlock,
+		}
+		if key.Direction == 1 {
+			rule.Direction = DirectionDst
+		}
+		if key.Port != 0 {
+			rule.Port = strconv.Itoa(int(key.Port))
+		}
+
+		for ifaceName := range fw.currentLinks {
+			rule.Interface = ifaceName
+			break
+		}
+
+		rules = append(rules, rule)
+	}
+
+	// Собираем разрешающие правила
+	iter = fw.allowedRules.Iterate()
+	for iter.Next(&key, &value) {
+		ip := make(net.IP, 4)
+		binary.LittleEndian.PutUint32(ip, key.IP)
+		rule := SavedRule{
+			IP:        ip.String(),
+			Protocol:  numberToProtocol(key.Proto),
+			Direction: DirectionSrc,
+			Port:      AnyPort,
+			Action:    ActionAllow,
 		}
 		if key.Direction == 1 {
 			rule.Direction = DirectionDst
@@ -292,30 +350,43 @@ func (fw *Firewall) writeRulesToFile(rules []SavedRule) error {
 }
 
 // HTTP Handlers
-func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
+func handleAddRule(w http.ResponseWriter, r *http.Request) {
 	if r.Method != HTTPMethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	br := BlockRequest{
+	rr := RuleRequest{
 		Interface: r.FormValue("interface"),
 		IP:        r.FormValue("ip"),
 		Protocol:  r.FormValue("protocol"),
 		Direction: r.FormValue("direction"),
 		Port:      r.FormValue("port"),
+		Action:    r.FormValue("action"),
 	}
 
-	if br.Interface == "" || br.IP == "" || br.Protocol == "" || br.Direction == "" {
-		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
+	if rr.Interface == "" || rr.IP == "" || rr.Protocol == "" || rr.Direction == "" || rr.Action == "" {
+		http.Error(w, "interface, ip, protocol, direction and action parameters are required", http.StatusBadRequest)
 		return
 	}
 
-	if br.Port == "" {
-		br.Port = AnyPort
+	if rr.Port == "" {
+		rr.Port = AnyPort
 	}
 
-	rule := SavedRule(br)
+	if rr.Action != ActionBlock && rr.Action != ActionAllow {
+		http.Error(w, "action must be either 'block' or 'allow'", http.StatusBadRequest)
+		return
+	}
+
+	rule := SavedRule{
+		Interface: rr.Interface,
+		IP:        rr.IP,
+		Protocol:  rr.Protocol,
+		Direction: rr.Direction,
+		Port:      rr.Port,
+		Action:    rr.Action,
+	}
 
 	if err := firewall.ApplyRule(rule); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to apply rule: %v", err), http.StatusInternalServerError)
@@ -327,35 +398,36 @@ func handleBlockRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "Successfully blocked %s %s traffic for IP: %s, port: %s on interface %s\n",
-		rule.Direction, rule.Protocol, rule.IP, rule.Port, rule.Interface)
+	fmt.Fprintf(w, "Successfully %sed %s %s traffic for IP: %s, port: %s on interface %s\n",
+		rr.Action, rr.Direction, rr.Protocol, rr.IP, rr.Port, rr.Interface)
 }
 
-func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
+func handleRemoveRule(w http.ResponseWriter, r *http.Request) {
 	if r.Method != HTTPMethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	br := BlockRequest{
+	rr := RuleRequest{
 		Interface: r.FormValue("interface"),
 		IP:        r.FormValue("ip"),
 		Protocol:  r.FormValue("protocol"),
 		Direction: r.FormValue("direction"),
 		Port:      r.FormValue("port"),
+		Action:    r.FormValue("action"),
 	}
 
-	if br.Interface == "" || br.IP == "" || br.Protocol == "" || br.Direction == "" {
-		http.Error(w, "interface, ip, protocol and direction parameters are required", http.StatusBadRequest)
+	if rr.IP == "" || rr.Protocol == "" || rr.Direction == "" {
+		http.Error(w, "ip, protocol and direction parameters are required", http.StatusBadRequest)
 		return
 	}
 
-	if br.Port == "" {
-		br.Port = AnyPort
+	if rr.Port == "" {
+		rr.Port = AnyPort
 	}
 
-	if err := firewall.RemoveRule(br); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to unblock IP: %v", err), http.StatusInternalServerError)
+	if err := firewall.RemoveRule(rr); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to remove rule: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -364,9 +436,8 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		newRules := make([]SavedRule, 0)
 		for _, rule := range rules {
-			if rule.IP == br.IP && rule.Protocol == br.Protocol &&
-				rule.Direction == br.Direction && rule.Interface == br.Interface &&
-				rule.Port == br.Port {
+			if rule.IP == rr.IP && rule.Protocol == rr.Protocol &&
+				rule.Direction == rr.Direction && rule.Port == rr.Port {
 				continue
 			}
 			newRules = append(newRules, rule)
@@ -374,11 +445,11 @@ func handleUnblockRequest(w http.ResponseWriter, r *http.Request) {
 		firewall.writeRulesToFile(newRules)
 	}
 
-	fmt.Fprintf(w, "Successfully unblocked %s %s traffic for IP: %s, port: %s\n",
-		br.Direction, br.Protocol, br.IP, br.Port)
+	fmt.Fprintf(w, "Successfully removed rule for %s %s traffic for IP: %s, port: %s\n",
+		rr.Direction, rr.Protocol, rr.IP, rr.Port)
 }
 
-func handleListRequest(w http.ResponseWriter, r *http.Request) {
+func handleListRules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != HTTPMethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -391,14 +462,14 @@ func handleListRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(rules) == 0 {
-		fmt.Fprintln(w, "No blocked rules")
+		fmt.Fprintln(w, "No rules defined")
 		return
 	}
 
-	fmt.Fprintln(w, "Blocked rules:")
+	fmt.Fprintln(w, "Current rules:")
 	for _, rule := range rules {
-		fmt.Fprintf(w, "- Interface: %s, IP: %s, Protocol: %s, Direction: %s, Port: %s\n",
-			rule.Interface, rule.IP, rule.Protocol, rule.Direction, rule.Port)
+		fmt.Fprintf(w, "- Action: %s, Interface: %s, IP: %s, Protocol: %s, Direction: %s, Port: %s\n",
+			rule.Action, rule.Interface, rule.IP, rule.Protocol, rule.Direction, rule.Port)
 	}
 }
 
@@ -452,9 +523,9 @@ func numberToProtocol(num uint8) string {
 }
 
 func setupHTTPServer() {
-	http.HandleFunc("/block", handleBlockRequest)
-	http.HandleFunc("/unblock", handleUnblockRequest)
-	http.HandleFunc("/list", handleListRequest)
+	http.HandleFunc("/add-rule", handleAddRule)
+	http.HandleFunc("/remove-rule", handleRemoveRule)
+	http.HandleFunc("/list-rules", handleListRules)
 
 	go func() {
 		log.Printf("Starting server on %s", ServerPort)

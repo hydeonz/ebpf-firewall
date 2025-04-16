@@ -10,6 +10,8 @@
 
 #define MAX_BLOCKED_IPS 256
 #define MAX_BLOCKED_PORTS 1024
+#define MAX_ALLOWED_IPS 256
+#define MAX_ALLOWED_PORTS 1024
 
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
@@ -21,6 +23,7 @@ struct rule_key {
     __u16 port;    // 0 означает любое значение порта
 };
 
+// Карта для блокирующих правил
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_BLOCKED_IPS * 10);
@@ -28,8 +31,16 @@ struct {
     __type(value, __u8);
 } blocked_rules SEC(".maps");
 
+// Карта для разрешающих правил (более высокий приоритет)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ALLOWED_IPS * 10);
+    __type(key, struct rule_key);
+    __type(value, __u8);
+} allowed_rules SEC(".maps");
+
 SEC("xdp")
-int xdp_block_ip(struct xdp_md *ctx) {
+int xdp_filter_ip(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
@@ -63,23 +74,21 @@ int xdp_block_ip(struct xdp_md *ctx) {
     __be32 saddr = ip->saddr;
     __be32 daddr = ip->daddr;
 
-    // Проверяем правила для исходного адреса
+    // Создаем ключи для проверки правил
     struct rule_key src_key = {
         .ip = saddr,
         .proto = ip->protocol,
         .direction = 0,
-        .port = 0 // Проверка без учета порта
+        .port = 0
     };
 
-    // Проверяем правила для адреса назначения
     struct rule_key dst_key = {
         .ip = daddr,
         .proto = ip->protocol,
         .direction = 1,
-        .port = 0 // Проверка без учета порта
+        .port = 0
     };
 
-    // Проверяем правила с учетом портов (если они есть в пакете)
     struct rule_key src_port_key = {
         .ip = saddr,
         .proto = ip->protocol,
@@ -94,7 +103,31 @@ int xdp_block_ip(struct xdp_md *ctx) {
         .port = dst_port
     };
 
-    // Сначала проверяем правила с конкретными портами
+    // Сначала проверяем разрешающие правила (более высокий приоритет)
+    // Проверяем правила с конкретными портами
+    if (bpf_map_lookup_elem(&allowed_rules, &src_port_key)) {
+        bpf_printk("ALLOWED OUTGOING: Src %pI4:%d Proto %d", &saddr, src_port, ip->protocol);
+        return XDP_PASS;
+    }
+
+    if (bpf_map_lookup_elem(&allowed_rules, &dst_port_key)) {
+        bpf_printk("ALLOWED INCOMING: Dst %pI4:%d Proto %d", &daddr, dst_port, ip->protocol);
+        return XDP_PASS;
+    }
+
+    // Затем проверяем общие разрешающие правила без учета портов
+    if (bpf_map_lookup_elem(&allowed_rules, &src_key)) {
+        bpf_printk("ALLOWED OUTGOING: Src %pI4 Proto %d", &saddr, ip->protocol);
+        return XDP_PASS;
+    }
+
+    if (bpf_map_lookup_elem(&allowed_rules, &dst_key)) {
+        bpf_printk("ALLOWED INCOMING: Dst %pI4 Proto %d", &daddr, ip->protocol);
+        return XDP_PASS;
+    }
+
+    // Только если нет разрешающих правил, проверяем блокирующие
+    // Проверяем правила с конкретными портами
     if (bpf_map_lookup_elem(&blocked_rules, &src_port_key)) {
         bpf_printk("BLOCKED OUTGOING: Src %pI4:%d Proto %d", &saddr, src_port, ip->protocol);
         return XDP_DROP;
@@ -105,7 +138,7 @@ int xdp_block_ip(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    // Затем проверяем общие правила без учета портов
+    // Проверяем общие блокирующие правила без учета портов
     if (bpf_map_lookup_elem(&blocked_rules, &src_key)) {
         bpf_printk("BLOCKED OUTGOING: Src %pI4 Proto %d", &saddr, ip->protocol);
         return XDP_DROP;
@@ -116,6 +149,7 @@ int xdp_block_ip(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
+    // Если нет ни разрешающих, ни блокирующих правил - пропускаем пакет
     return XDP_PASS;
 }
 
