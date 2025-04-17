@@ -1,34 +1,37 @@
-[
-  {
-    "interface": "wlp3s0",
-    "ip": "192.168.2.33",
-    "protocol": "icmp",
-    "direction": "src",
-    "port": "any",
-    "action": "block"
-  },
-  {
-    "interface": "wlp3s0",
-    "ip": "192.168.2.34",
-    "protocol": "tcp",
-    "direction": "src",
-    "port": "any",
-    "action": "block"
-  },
-  {
-    "interface": "wlp3s0",
-    "ip": "192.168.2.34",
-    "protocol": "tcp",
-    "direction": "src",
-    "port": "22",
-    "action": "allow"
-  },
-  {
-    "interface": "wlp3s0",
-    "ip": "8.8.8.8",
-    "protocol": "icmp",
-    "direction": "src",
-    "port": "any",
-    "action": "allow"
-  }
-]
+{
+  "rules": [
+    {
+      "interface": "wlp3s0",
+      "ip": "8.8.8.8",
+      "protocol": "icmp",
+      "direction": "src",
+      "port": "any",
+      "action": "allow"
+    },
+    {
+      "interface": "wlp3s0",
+      "ip": "1.1.1.1",
+      "protocol": "icmp",
+      "direction": "src",
+      "port": "any",
+      "action": "allow"
+    },
+    {
+      "interface": "wlp3s0",
+      "ip": "127.0.0.53",
+      "protocol": "all",
+      "direction": "src",
+      "port": "any",
+      "action": "allow"
+    },
+    {
+      "interface": "wlp3s0",
+      "ip": "192.168.2.33",
+      "protocol": "icmp",
+      "direction": "src",
+      "port": "any",
+      "action": "allow"
+    }
+  ],
+  "global_block": true
+}

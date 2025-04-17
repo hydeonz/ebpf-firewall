@@ -58,6 +58,11 @@ type SavedRule struct {
 	Action    string `json:"action"`
 }
 
+type RulesFileFormat struct {
+	Rules       []SavedRule `json:"rules"`
+	GlobalBlock bool        `json:"global_block"`
+}
+
 type Firewall struct {
 	collection   *ebpf.Collection
 	blockedRules *ebpf.Map
@@ -226,12 +231,20 @@ func (fw *Firewall) RemoveRule(rr RuleRequest) error {
 }
 
 func (fw *Firewall) LoadAndApplyRules() error {
-	rules, err := fw.loadRulesFromFile()
+	rulesFile, err := fw.loadRulesFromFile()
 	if err != nil {
 		return err
 	}
 
-	for _, rule := range rules {
+	// Apply global block setting if it exists in the file
+	if rulesFile.GlobalBlock {
+		if err := fw.SetGlobalBlock(true); err != nil {
+			log.Printf("Failed to apply global block: %v", err)
+		}
+	}
+
+	// Apply all rules from the file
+	for _, rule := range rulesFile.Rules {
 		if err := fw.ApplyRule(rule); err != nil {
 			log.Printf("Failed to apply rule: %v", err)
 		}
@@ -240,12 +253,12 @@ func (fw *Firewall) LoadAndApplyRules() error {
 	return nil
 }
 
-func (fw *Firewall) loadRulesFromFile() ([]SavedRule, error) {
+func (fw *Firewall) loadRulesFromFile() (*RulesFileFormat, error) {
 	fw.rulesMutex.Lock()
 	defer fw.rulesMutex.Unlock()
 
 	if _, err := os.Stat(RulesFile); os.IsNotExist(err) {
-		return nil, nil
+		return &RulesFileFormat{Rules: []SavedRule{}}, nil
 	}
 
 	data, err := os.ReadFile(RulesFile)
@@ -253,12 +266,12 @@ func (fw *Firewall) loadRulesFromFile() ([]SavedRule, error) {
 		return nil, fmt.Errorf("failed to read rules file: %v", err)
 	}
 
-	var rules []SavedRule
-	if err := json.Unmarshal(data, &rules); err != nil {
+	var rulesFile RulesFileFormat
+	if err := json.Unmarshal(data, &rulesFile); err != nil {
 		return nil, fmt.Errorf("failed to parse rules: %v", err)
 	}
 
-	return rules, nil
+	return &rulesFile, nil
 }
 
 func (fw *Firewall) saveRulesToFile() error {
@@ -322,11 +335,18 @@ func (fw *Firewall) saveRulesToFile() error {
 		rules = append(rules, rule)
 	}
 
-	return fw.writeRulesToFile(rules)
-}
+	// Get current global block status
+	var globalBlockVal uint8
+	if err := fw.globalBlock.Lookup(uint8(0), &globalBlockVal); err != nil {
+		return fmt.Errorf("failed to get global block status: %v", err)
+	}
 
-func (fw *Firewall) writeRulesToFile(rules []SavedRule) error {
-	data, err := json.MarshalIndent(rules, "", "  ")
+	rulesFile := RulesFileFormat{
+		Rules:       rules,
+		GlobalBlock: globalBlockVal == 1,
+	}
+
+	data, err := json.MarshalIndent(rulesFile, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal rules: %v", err)
 	}
@@ -424,45 +444,13 @@ func handleRemoveRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rules, err := firewall.loadRulesFromFile()
-	if err == nil {
-		newRules := make([]SavedRule, 0)
-		for _, rule := range rules {
-			if rule.IP == rr.IP && rule.Protocol == rr.Protocol &&
-				rule.Direction == rr.Direction && rule.Port == rr.Port {
-				continue
-			}
-			newRules = append(newRules, rule)
-		}
-		firewall.writeRulesToFile(newRules)
+	if err := firewall.saveRulesToFile(); err != nil {
+		http.Error(w, fmt.Sprintf("Rule removed but failed to save: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	fmt.Fprintf(w, "Successfully removed rule for %s %s traffic for IP: %s, port: %s\n",
 		rr.Direction, rr.Protocol, rr.IP, rr.Port)
-}
-
-func handleListRules(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	rules, err := firewall.loadRulesFromFile()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to load rules: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if len(rules) == 0 {
-		fmt.Fprintln(w, "No rules defined")
-		return
-	}
-
-	fmt.Fprintln(w, "Current rules:")
-	for _, rule := range rules {
-		fmt.Fprintf(w, "- Action: %s, Interface: %s, IP: %s, Protocol: %s, Direction: %s, Port: %s\n",
-			rule.Action, rule.Interface, rule.IP, rule.Protocol, rule.Direction, rule.Port)
-	}
 }
 
 func handleGlobalBlock(w http.ResponseWriter, r *http.Request) {
@@ -483,11 +471,42 @@ func handleGlobalBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := firewall.saveRulesToFile(); err != nil {
+		http.Error(w, fmt.Sprintf("Global block set but failed to save: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	status := "disabled"
 	if enabled {
 		status = "enabled"
 	}
 	fmt.Fprintf(w, "Global block %s\n", status)
+}
+
+func handleListRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != HTTPMethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rulesFile, err := firewall.loadRulesFromFile()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to load rules: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintln(w, "Current rules:")
+	fmt.Fprintf(w, "Global block: %t\n", rulesFile.GlobalBlock)
+
+	if len(rulesFile.Rules) == 0 {
+		fmt.Fprintln(w, "No rules defined")
+		return
+	}
+
+	for _, rule := range rulesFile.Rules {
+		fmt.Fprintf(w, "- Action: %s, Interface: %s, IP: %s, Protocol: %s, Direction: %s, Port: %s\n",
+			rule.Action, rule.Interface, rule.IP, rule.Protocol, rule.Direction, rule.Port)
+	}
 }
 
 func directionToNumber(direction string) uint8 {
