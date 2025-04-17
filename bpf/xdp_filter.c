@@ -169,4 +169,84 @@ int xdp_filter_ip(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
+SEC("classifier/egress")
+int tc_egress_filter(struct __sk_buff *skb) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    // Проверяем, что пакет содержит Ethernet + IP заголовки
+    struct ethhdr *eth = data;
+    if (data + sizeof(*eth) > data_end)
+        return TC_ACT_OK; // Пропускаем, если заголовок неполный
+
+    // Фильтруем только IPv4
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;
+
+    struct iphdr *ip = data + sizeof(*eth);
+    if (data + sizeof(*eth) + sizeof(*ip) > data_end)
+        return TC_ACT_OK;
+
+    // Получаем dst IP (для egress это адрес назначения)
+    __be32 daddr = ip->daddr;
+
+    // Проверяем порт (если TCP/UDP)
+    __u16 dst_port = 0;
+    if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
+        struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+        struct udphdr *udp = (void *)ip + sizeof(*ip);
+
+        if ((void *)tcp + sizeof(*tcp) <= data_end) {
+            dst_port = bpf_ntohs(ip->protocol == IPPROTO_TCP ? tcp->dest : udp->dest);
+        }
+    }
+
+    // Создаем ключ для проверки правил (direction = 1, так как это egress)
+    struct rule_key dst_key = {
+        .ip = daddr,
+        .proto = ip->protocol,
+        .direction = 1,
+        .port = 0
+    };
+
+    struct rule_key dst_port_key = {
+        .ip = daddr,
+        .proto = ip->protocol,
+        .direction = 1,
+        .port = dst_port
+    };
+
+    // Сначала проверяем разрешающие правила (более высокий приоритет)
+    if (bpf_map_lookup_elem(&allowed_rules, &dst_port_key)) {
+        bpf_printk("ALLOWED EGRESS (TC): Dst %pI4:%d Proto %d", &daddr, dst_port, ip->protocol);
+        return TC_ACT_OK;
+    }
+
+    if (bpf_map_lookup_elem(&allowed_rules, &dst_key)) {
+        bpf_printk("ALLOWED EGRESS (TC): Dst %pI4 Proto %d", &daddr, ip->protocol);
+        return TC_ACT_OK;
+    }
+
+    // Проверяем глобальную блокировку
+    __u8 key = 0;
+    __u8 *global_block_enabled = bpf_map_lookup_elem(&global_block, &key);
+    if (global_block_enabled && *global_block_enabled) {
+        return TC_ACT_SHOT; // Блокируем весь трафик
+    }
+
+    // Проверяем блокирующие правила
+    if (bpf_map_lookup_elem(&blocked_rules, &dst_port_key)) {
+        bpf_printk("BLOCKED EGRESS (TC): Dst %pI4:%d Proto %d", &daddr, dst_port, ip->protocol);
+        return TC_ACT_SHOT;
+    }
+
+    if (bpf_map_lookup_elem(&blocked_rules, &dst_key)) {
+        bpf_printk("BLOCKED EGRESS (TC): Dst %pI4 Proto %d", &daddr, ip->protocol);
+        return TC_ACT_SHOT;
+    }
+
+    // Если правил нет - пропускаем пакет
+    return TC_ACT_OK;
+}
+
 char _license[] SEC("license") = "GPL";

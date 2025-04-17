@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/vishvananda/netlink"
 	"log"
 	"net"
 	"net/http"
@@ -64,12 +65,13 @@ type RulesFileFormat struct {
 }
 
 type Firewall struct {
-	collection   *ebpf.Collection
-	blockedRules *ebpf.Map
-	allowedRules *ebpf.Map
-	globalBlock  *ebpf.Map
-	currentLinks map[string]link.Link
-	rulesMutex   sync.Mutex
+	collection     *ebpf.Collection
+	blockedRules   *ebpf.Map
+	allowedRules   *ebpf.Map
+	globalBlock    *ebpf.Map
+	currentLinks   map[string]link.Link     // XDP
+	currentTcLinks map[string]netlink.Qdisc // TC
+	rulesMutex     sync.Mutex
 }
 
 var firewall *Firewall
@@ -120,17 +122,34 @@ func NewFirewall() (*Firewall, error) {
 	}
 
 	return &Firewall{
-		collection:   coll,
-		blockedRules: blockedRules,
-		allowedRules: allowedRules,
-		globalBlock:  globalBlock,
-		currentLinks: make(map[string]link.Link),
+		collection:     coll,
+		blockedRules:   blockedRules,
+		allowedRules:   allowedRules,
+		globalBlock:    globalBlock,
+		currentLinks:   make(map[string]link.Link),
+		currentTcLinks: make(map[string]netlink.Qdisc),
 	}, nil
+
 }
 
 func (fw *Firewall) Close() {
 	for _, lnk := range fw.currentLinks {
 		lnk.Close()
+	}
+	for iface, _ := range fw.currentTcLinks {
+		ifaceObj, err := net.InterfaceByName(iface)
+		if err == nil {
+			// Удалим qdisc clsact
+			qdisc := &netlink.GenericQdisc{
+				QdiscAttrs: netlink.QdiscAttrs{
+					LinkIndex: ifaceObj.Index,
+					Handle:    netlink.MakeHandle(1, 0),
+					Parent:    netlink.HANDLE_CLSACT,
+				},
+				QdiscType: "clsact",
+			}
+			_ = netlink.QdiscDel(qdisc)
+		}
 	}
 	fw.collection.Close()
 }
@@ -179,22 +198,63 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 		return fmt.Errorf("failed to insert into BPF map: %v", err)
 	}
 
-	if _, exists := fw.currentLinks[rule.Interface]; !exists {
-		iface, err := net.InterfaceByName(rule.Interface)
-		if err != nil {
-			return fmt.Errorf("interface not found: %s", rule.Interface)
-		}
-		opts := link.XDPOptions{
-			Program:   fw.collection.Programs["xdp_filter_ip"],
-			Interface: iface.Index,
-		}
-		lnk, err := link.AttachXDP(opts)
-		if err != nil {
-			return fmt.Errorf("failed to attach XDP: %v", err)
-		}
-		fw.currentLinks[rule.Interface] = lnk
+	iface, err := net.InterfaceByName(rule.Interface)
+	if err != nil {
+		return fmt.Errorf("interface not found: %s", rule.Interface)
 	}
 
+	// Attach XDP (ingress) only once
+	if rule.Direction == DirectionSrc {
+		if _, exists := fw.currentLinks[rule.Interface]; !exists {
+			opts := link.XDPOptions{
+				Program:   fw.collection.Programs["xdp_filter_ip"],
+				Interface: iface.Index,
+			}
+			lnk, err := link.AttachXDP(opts)
+			if err != nil {
+				return fmt.Errorf("failed to attach XDP: %v", err)
+			}
+			fw.currentLinks[rule.Interface] = lnk
+		}
+	} else if rule.Direction == DirectionDst {
+		if _, exists := fw.currentTcLinks[rule.Interface]; !exists {
+			qdisc := &netlink.GenericQdisc{
+				QdiscAttrs: netlink.QdiscAttrs{
+					LinkIndex: iface.Index,
+					Handle:    netlink.MakeHandle(1, 0),
+					Parent:    netlink.HANDLE_CLSACT,
+				},
+				QdiscType: "clsact",
+			}
+			if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) {
+				return fmt.Errorf("failed to add qdisc: %v", err)
+			}
+
+			prog := fw.collection.Programs["tc_egress_filter"]
+			if prog == nil {
+				return fmt.Errorf("TC program not found in collection")
+			}
+
+			filter := &netlink.BpfFilter{
+				FilterAttrs: netlink.FilterAttrs{
+					LinkIndex: iface.Index,
+					Parent:    netlink.HANDLE_MIN_EGRESS,
+					Handle:    netlink.MakeHandle(1, 0),
+					Priority:  1,
+					Protocol:  syscall.ETH_P_ALL,
+				},
+				Fd:           prog.FD(),
+				Name:         "tc_egress_filter",
+				DirectAction: true,
+			}
+
+			if err := netlink.FilterAdd(filter); err != nil {
+				return fmt.Errorf("failed to attach BPF filter with netlink: %v", err)
+			}
+
+			fw.currentTcLinks[rule.Interface] = qdisc
+		}
+	}
 	return nil
 }
 
@@ -309,14 +369,25 @@ func (fw *Firewall) saveRulesToFile() error {
 			rule.Port = strconv.Itoa(int(key.Port))
 		}
 
-		for ifaceName := range fw.currentLinks {
-			rule.Interface = ifaceName
-			break
+		// Find the interface this rule belongs to by checking both XDP and TC attachments
+		for ifaceName, lnk := range fw.currentLinks {
+			if lnk != nil { // Check if the link exists
+				rule.Interface = ifaceName
+				break
+			}
+		}
+		// If not found in XDP, check TC
+		if rule.Interface == "" {
+			for ifaceName := range fw.currentTcLinks {
+				rule.Interface = ifaceName
+				break
+			}
 		}
 
 		rules = append(rules, rule)
 	}
 
+	// Do the same for the allowedRules iteration
 	iter = fw.allowedRules.Iterate()
 	for iter.Next(&key, &value) {
 		ip := make(net.IP, 4)
@@ -335,9 +406,18 @@ func (fw *Firewall) saveRulesToFile() error {
 			rule.Port = strconv.Itoa(int(key.Port))
 		}
 
-		for ifaceName := range fw.currentLinks {
-			rule.Interface = ifaceName
-			break
+		// Find the interface this rule belongs to
+		for ifaceName, lnk := range fw.currentLinks {
+			if lnk != nil {
+				rule.Interface = ifaceName
+				break
+			}
+		}
+		if rule.Interface == "" {
+			for ifaceName := range fw.currentTcLinks {
+				rule.Interface = ifaceName
+				break
+			}
 		}
 
 		rules = append(rules, rule)

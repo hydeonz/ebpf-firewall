@@ -7,6 +7,14 @@
       "direction": "src",
       "port": "any",
       "action": "block"
+    },
+    {
+      "interface": "wlp3s0",
+      "ip": "8.8.8.8",
+      "protocol": "icmp",
+      "direction": "dst",
+      "port": "any",
+      "action": "block"
     }
   ],
   "global_block": false
