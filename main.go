@@ -219,12 +219,22 @@ func (fw *Firewall) RemoveRule(rr RuleRequest) error {
 
 	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
 
-	if err := fw.blockedRules.Delete(key); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove from blocked rules: %v", err)
+	// Пытаемся удалить из соответствующей карты в зависимости от action
+	var targetMap *ebpf.Map
+	switch rr.Action {
+	case ActionBlock:
+		targetMap = fw.blockedRules
+	case ActionAllow:
+		targetMap = fw.allowedRules
+	default:
+		return fmt.Errorf("invalid action: %s", rr.Action)
 	}
 
-	if err := fw.allowedRules.Delete(key); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove from allowed rules: %v", err)
+	if err := targetMap.Delete(key); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("rule not found in %s rules", rr.Action)
+		}
+		return fmt.Errorf("failed to remove from %s rules: %v", rr.Action, err)
 	}
 
 	return nil
@@ -237,10 +247,8 @@ func (fw *Firewall) LoadAndApplyRules() error {
 	}
 
 	// Apply global block setting if it exists in the file
-	if rulesFile.GlobalBlock {
-		if err := fw.SetGlobalBlock(true); err != nil {
-			log.Printf("Failed to apply global block: %v", err)
-		}
+	if err := fw.SetGlobalBlock(rulesFile.GlobalBlock); err != nil {
+		log.Printf("Failed to apply global block: %v", err)
 	}
 
 	// Apply all rules from the file
