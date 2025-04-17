@@ -3,16 +3,16 @@
     {
       "interface": "wlp3s0",
       "ip": "1.1.1.1",
-      "protocol": "icmp",
-      "direction": "src",
+      "protocol": "tcp",
+      "direction": "dst",
       "port": "any",
       "action": "block"
     },
     {
       "interface": "wlp3s0",
-      "ip": "8.8.8.8",
+      "ip": "1.1.1.1",
       "protocol": "icmp",
-      "direction": "dst",
+      "direction": "src",
       "port": "any",
       "action": "block"
     }
