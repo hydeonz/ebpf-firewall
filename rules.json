@@ -9,8 +9,8 @@
   },
   {
     "interface": "wlp3s0",
-    "ip": "192.168.2.33",
-    "protocol": "icmp",
+    "ip": "192.168.2.34",
+    "protocol": "tcp",
     "direction": "src",
     "port": "any",
     "action": "block"
@@ -25,10 +25,10 @@
   },
   {
     "interface": "wlp3s0",
-    "ip": "192.168.2.34",
-    "protocol": "tcp",
+    "ip": "8.8.8.8",
+    "protocol": "icmp",
     "direction": "src",
     "port": "any",
-    "action": "block"
+    "action": "allow"
   }
 ]

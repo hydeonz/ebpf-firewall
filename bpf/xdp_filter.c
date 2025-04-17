@@ -15,6 +15,7 @@
 
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
+#define IPPROTO_ICMP 1
 
 struct rule_key {
     __le32 ip;
@@ -38,6 +39,14 @@ struct {
     __type(key, struct rule_key);
     __type(value, __u8);
 } allowed_rules SEC(".maps");
+
+// Карта для глобальной блокировки
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1);
+    __type(key, __u8);
+    __type(value, __u8);
+} global_block SEC(".maps");
 
 SEC("xdp")
 int xdp_filter_ip(struct xdp_md *ctx) {
@@ -124,6 +133,13 @@ int xdp_filter_ip(struct xdp_md *ctx) {
     if (bpf_map_lookup_elem(&allowed_rules, &dst_key)) {
         bpf_printk("ALLOWED INCOMING: Dst %pI4 Proto %d", &daddr, ip->protocol);
         return XDP_PASS;
+    }
+
+    // Проверяем глобальную блокировку (если включена, блокируем весь трафик)
+    __u8 key = 0;
+    __u8 *global_block_enabled = bpf_map_lookup_elem(&global_block, &key);
+    if (global_block_enabled && *global_block_enabled) {
+        return XDP_DROP;
     }
 
     // Только если нет разрешающих правил, проверяем блокирующие
