@@ -62,6 +62,7 @@ type SavedRule struct {
 type RulesFileFormat struct {
 	Rules       []SavedRule `json:"rules"`
 	GlobalBlock bool        `json:"global_block"`
+	GlobalAllow bool        `json:"global_allow"`
 }
 
 type Firewall struct {
@@ -69,6 +70,7 @@ type Firewall struct {
 	blockedRules   *ebpf.Map
 	allowedRules   *ebpf.Map
 	globalBlock    *ebpf.Map
+	globalAllow    *ebpf.Map
 	currentLinks   map[string]link.Link     // XDP
 	currentTcLinks map[string]netlink.Qdisc // TC
 	rulesMutex     sync.Mutex
@@ -121,36 +123,77 @@ func NewFirewall() (*Firewall, error) {
 		return nil, fmt.Errorf("global_block map not found")
 	}
 
+	globalAllow := coll.Maps["global_allow"]
+	if globalAllow == nil {
+		coll.Close()
+		return nil, fmt.Errorf("global_allow map not found")
+	}
+
 	return &Firewall{
 		collection:     coll,
 		blockedRules:   blockedRules,
 		allowedRules:   allowedRules,
 		globalBlock:    globalBlock,
+		globalAllow:    globalAllow,
 		currentLinks:   make(map[string]link.Link),
 		currentTcLinks: make(map[string]netlink.Qdisc),
 	}, nil
-
 }
 
 func (fw *Firewall) Close() {
-	for _, lnk := range fw.currentLinks {
-		lnk.Close()
-	}
-	for iface, _ := range fw.currentTcLinks {
-		ifaceObj, err := net.InterfaceByName(iface)
-		if err == nil {
-			// Удалим qdisc clsact
-			qdisc := &netlink.GenericQdisc{
-				QdiscAttrs: netlink.QdiscAttrs{
-					LinkIndex: ifaceObj.Index,
-					Handle:    netlink.MakeHandle(1, 0),
-					Parent:    netlink.HANDLE_CLSACT,
-				},
-				QdiscType: "clsact",
-			}
-			_ = netlink.QdiscDel(qdisc)
+	// Закрываем все XDP линки
+	for iface, lnk := range fw.currentLinks {
+		if err := lnk.Close(); err != nil {
+			log.Printf("Failed to close XDP link for interface %s: %v", iface, err)
 		}
 	}
+
+	// Удаляем все TC фильтры и qdisc
+	for iface := range fw.currentTcLinks {
+		ifaceObj, err := net.InterfaceByName(iface)
+		if err != nil {
+			log.Printf("Failed to get interface %s: %v", iface, err)
+			continue
+		}
+
+		// Сначала удаляем фильтры
+		filters, err := netlink.FilterList(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{
+			Index: ifaceObj.Index,
+		}}, netlink.HANDLE_MIN_EGRESS)
+		if err != nil {
+			log.Printf("Failed to list filters for interface %s: %v", iface, err)
+			continue
+		}
+
+		for _, filter := range filters {
+			if bpfFilter, ok := filter.(*netlink.BpfFilter); ok {
+				if err := netlink.FilterDel(bpfFilter); err != nil {
+					log.Printf("Failed to delete BPF filter on interface %s: %v", iface, err)
+				}
+			}
+		}
+
+		// Затем удаляем qdisc clsact
+		qdisc := &netlink.GenericQdisc{
+			QdiscAttrs: netlink.QdiscAttrs{
+				LinkIndex: ifaceObj.Index,
+				Handle:    netlink.MakeHandle(0xffff, 0), // Исправленный handle
+				Parent:    netlink.HANDLE_CLSACT,
+			},
+			QdiscType: "clsact",
+		}
+
+		// Пробуем удалить с разными родительскими handles
+		if err := netlink.QdiscDel(qdisc); err != nil {
+			// Пробуем альтернативный вариант
+			qdisc.Parent = netlink.HANDLE_INGRESS
+			if err := netlink.QdiscDel(qdisc); err != nil {
+				log.Printf("Failed to delete qdisc on interface %s: %v", iface, err)
+			}
+		}
+	}
+
+	// Закрываем коллекцию eBPF
 	fw.collection.Close()
 }
 
@@ -160,7 +203,28 @@ func (fw *Firewall) SetGlobalBlock(enabled bool) error {
 	if enabled {
 		value = 1
 	}
+	// Если включаем глобальную блокировку, выключаем глобальное разрешение
+	if enabled {
+		if err := fw.globalAllow.Put(key, uint8(0)); err != nil {
+			return err
+		}
+	}
 	return fw.globalBlock.Put(key, value)
+}
+
+func (fw *Firewall) SetGlobalAllow(enabled bool) error {
+	key := uint8(0)
+	value := uint8(0)
+	if enabled {
+		value = 1
+	}
+	// Если включаем глобальное разрешение, выключаем глобальную блокировку
+	if enabled {
+		if err := fw.globalBlock.Put(key, uint8(0)); err != nil {
+			return err
+		}
+	}
+	return fw.globalAllow.Put(key, value)
 }
 
 func (fw *Firewall) ApplyRule(rule SavedRule) error {
@@ -279,7 +343,6 @@ func (fw *Firewall) RemoveRule(rr RuleRequest) error {
 
 	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
 
-	// Пытаемся удалить из соответствующей карты в зависимости от action
 	var targetMap *ebpf.Map
 	switch rr.Action {
 	case ActionBlock:
@@ -306,9 +369,12 @@ func (fw *Firewall) LoadAndApplyRules() error {
 		return err
 	}
 
-	// Apply global block setting if it exists in the file
+	// Apply global settings from the file
 	if err := fw.SetGlobalBlock(rulesFile.GlobalBlock); err != nil {
 		log.Printf("Failed to apply global block: %v", err)
+	}
+	if err := fw.SetGlobalAllow(rulesFile.GlobalAllow); err != nil {
+		log.Printf("Failed to apply global allow: %v", err)
 	}
 
 	// Apply all rules from the file
@@ -348,6 +414,7 @@ func (fw *Firewall) saveRulesToFile() error {
 
 	var rules []SavedRule
 
+	// Сохраняем блокирующие правила
 	iter := fw.blockedRules.Iterate()
 	var key RuleKey
 	var value uint8
@@ -369,14 +436,13 @@ func (fw *Firewall) saveRulesToFile() error {
 			rule.Port = strconv.Itoa(int(key.Port))
 		}
 
-		// Find the interface this rule belongs to by checking both XDP and TC attachments
+		// Находим интерфейс для этого правила
 		for ifaceName, lnk := range fw.currentLinks {
-			if lnk != nil { // Check if the link exists
+			if lnk != nil {
 				rule.Interface = ifaceName
 				break
 			}
 		}
-		// If not found in XDP, check TC
 		if rule.Interface == "" {
 			for ifaceName := range fw.currentTcLinks {
 				rule.Interface = ifaceName
@@ -387,7 +453,7 @@ func (fw *Firewall) saveRulesToFile() error {
 		rules = append(rules, rule)
 	}
 
-	// Do the same for the allowedRules iteration
+	// Сохраняем разрешающие правила
 	iter = fw.allowedRules.Iterate()
 	for iter.Next(&key, &value) {
 		ip := make(net.IP, 4)
@@ -406,7 +472,6 @@ func (fw *Firewall) saveRulesToFile() error {
 			rule.Port = strconv.Itoa(int(key.Port))
 		}
 
-		// Find the interface this rule belongs to
 		for ifaceName, lnk := range fw.currentLinks {
 			if lnk != nil {
 				rule.Interface = ifaceName
@@ -423,15 +488,19 @@ func (fw *Firewall) saveRulesToFile() error {
 		rules = append(rules, rule)
 	}
 
-	// Get current global block status
-	var globalBlockVal uint8
+	// Получаем текущие глобальные настройки
+	var globalBlockVal, globalAllowVal uint8
 	if err := fw.globalBlock.Lookup(uint8(0), &globalBlockVal); err != nil {
 		return fmt.Errorf("failed to get global block status: %v", err)
+	}
+	if err := fw.globalAllow.Lookup(uint8(0), &globalAllowVal); err != nil {
+		return fmt.Errorf("failed to get global allow status: %v", err)
 	}
 
 	rulesFile := RulesFileFormat{
 		Rules:       rules,
 		GlobalBlock: globalBlockVal == 1,
+		GlobalAllow: globalAllowVal == 1,
 	}
 
 	data, err := json.MarshalIndent(rulesFile, "", "  ")
@@ -571,6 +640,36 @@ func handleGlobalBlock(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Global block %s\n", status)
 }
 
+func handleGlobalAllow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != HTTPMethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	enable := r.FormValue("enable")
+	if enable == "" {
+		http.Error(w, "enable parameter is required (true/false)", http.StatusBadRequest)
+		return
+	}
+
+	enabled := enable == "true"
+	if err := firewall.SetGlobalAllow(enabled); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to set global allow: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if err := firewall.saveRulesToFile(); err != nil {
+		http.Error(w, fmt.Sprintf("Global allow set but failed to save: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	status := "disabled"
+	if enabled {
+		status = "enabled"
+	}
+	fmt.Fprintf(w, "Global allow %s\n", status)
+}
+
 func handleListRules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != HTTPMethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -585,6 +684,7 @@ func handleListRules(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintln(w, "Current rules:")
 	fmt.Fprintf(w, "Global block: %t\n", rulesFile.GlobalBlock)
+	fmt.Fprintf(w, "Global allow: %t\n", rulesFile.GlobalAllow)
 
 	if len(rulesFile.Rules) == 0 {
 		fmt.Fprintln(w, "No rules defined")
@@ -650,6 +750,7 @@ func setupHTTPServer() {
 	http.HandleFunc("/remove-rule", handleRemoveRule)
 	http.HandleFunc("/list-rules", handleListRules)
 	http.HandleFunc("/global-block", handleGlobalBlock)
+	http.HandleFunc("/global-allow", handleGlobalAllow)
 
 	go func() {
 		log.Printf("Starting server on %s", ServerPort)

@@ -2,10 +2,10 @@
   "rules": [
     {
       "interface": "wlp3s0",
-      "ip": "1.1.1.1",
+      "ip": "192.168.2.33",
       "protocol": "tcp",
       "direction": "dst",
-      "port": "any",
+      "port": "22",
       "action": "block"
     },
     {
@@ -17,5 +17,6 @@
       "action": "block"
     }
   ],
-  "global_block": false
+  "global_block": false,
+  "global_allow": false
 }

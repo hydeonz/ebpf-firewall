@@ -48,6 +48,14 @@ struct {
     __type(value, __u8);
 } global_block SEC(".maps");
 
+// Карта для глобального разрешения (наивысший приоритет)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1);
+    __type(key, __u8);
+    __type(value, __u8);
+} global_allow SEC(".maps");
+
 SEC("xdp")
 int xdp_filter_ip(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
@@ -63,6 +71,13 @@ int xdp_filter_ip(struct xdp_md *ctx) {
     struct iphdr *ip = data + sizeof(*eth);
     if (data + sizeof(*eth) + sizeof(*ip) > data_end)
         return XDP_PASS;
+
+    // Проверяем глобальное разрешение (наивысший приоритет)
+    __u8 key = 0;
+    __u8 *global_allow_enabled = bpf_map_lookup_elem(&global_allow, &key);
+    if (global_allow_enabled && *global_allow_enabled) {
+        return XDP_PASS;
+    }
 
     // Инициализируем порты нулями (будет означать "любой порт")
     __u16 src_port = 0;
@@ -112,7 +127,7 @@ int xdp_filter_ip(struct xdp_md *ctx) {
         .port = dst_port
     };
 
-    // Сначала проверяем разрешающие правила (более высокий приоритет)
+    // Сначала проверяем разрешающие правила (высокий приоритет)
     // Проверяем правила с конкретными портами
     if (bpf_map_lookup_elem(&allowed_rules, &src_port_key)) {
         bpf_printk("ALLOWED OUTGOING: Src %pI4:%d Proto %d", &saddr, src_port, ip->protocol);
@@ -136,7 +151,6 @@ int xdp_filter_ip(struct xdp_md *ctx) {
     }
 
     // Проверяем глобальную блокировку (если включена, блокируем весь трафик)
-    __u8 key = 0;
     __u8 *global_block_enabled = bpf_map_lookup_elem(&global_block, &key);
     if (global_block_enabled && *global_block_enabled) {
         return XDP_DROP;
@@ -173,6 +187,13 @@ SEC("classifier/egress")
 int tc_egress_filter(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+
+    // Проверяем глобальное разрешение (наивысший приоритет)
+    __u8 key = 0;
+    __u8 *global_allow_enabled = bpf_map_lookup_elem(&global_allow, &key);
+    if (global_allow_enabled && *global_allow_enabled) {
+        return TC_ACT_OK;
+    }
 
     // Проверяем, что пакет содержит Ethernet + IP заголовки
     struct ethhdr *eth = data;
@@ -216,7 +237,7 @@ int tc_egress_filter(struct __sk_buff *skb) {
         .port = dst_port
     };
 
-    // Сначала проверяем разрешающие правила (более высокий приоритет)
+    // Сначала проверяем разрешающие правила (высокий приоритет)
     if (bpf_map_lookup_elem(&allowed_rules, &dst_port_key)) {
         bpf_printk("ALLOWED EGRESS (TC): Dst %pI4:%d Proto %d", &daddr, dst_port, ip->protocol);
         return TC_ACT_OK;
@@ -228,7 +249,6 @@ int tc_egress_filter(struct __sk_buff *skb) {
     }
 
     // Проверяем глобальную блокировку
-    __u8 key = 0;
     __u8 *global_block_enabled = bpf_map_lookup_elem(&global_block, &key);
     if (global_block_enabled && *global_block_enabled) {
         return TC_ACT_SHOT; // Блокируем весь трафик
