@@ -1,3 +1,44 @@
+/**
+ * @file xdp_filter.c
+ * @brief eBPF-based network filter implementing XDP and TC packet filtering
+ *
+ * This program implements a flexible network packet filter using both XDP (eXpress Data Path)
+ * and TC (Traffic Control) hooks. It supports:
+ * - IP-based filtering (source and destination)
+ * - Protocol-based filtering (TCP, UDP, ICMP)
+ * - Port-based filtering (for TCP/UDP)
+ * - Bidirectional rules (incoming/outgoing traffic)
+ * - Global allow/block functionality
+ *
+ * Maps:
+ * - blocked_rules: Stores blocking rules
+ * - allowed_rules: Stores allowing rules (higher priority than blocking)
+ * - global_block: Enables/disables global traffic blocking
+ * - global_allow: Enables/disables global traffic allowing (highest priority)
+ *
+ * Rule Structure:
+ * - IP address
+ * - Protocol (TCP/UDP/ICMP)
+ * - Direction (source/destination)
+ * - Port number (0 means any port)
+ *
+ * Priority Order (highest to lowest):
+ * 1. Global allow
+ * 2. Specific allow rules (with ports)
+ * 3. Generic allow rules (without ports)
+ * 4. Global block
+ * 5. Specific block rules (with ports)
+ * 6. Generic block rules (without ports)
+ * 7. Default: PASS
+ *
+ * The program contains two main components:
+ * - XDP program (xdp_filter_ip): Filters packets at the earliest possible point
+ * - TC program (tc_egress_filter): Additional filtering for outgoing traffic
+ *
+ * @note Maximum entries for rules are defined by MAX_BLOCKED_IPS (256) and MAX_BLOCKED_PORTS (1024)
+ * @note The program requires a GPL license due to BPF helper usage
+ */
+
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
