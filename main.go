@@ -100,17 +100,18 @@ type GlobalStatusResponse struct {
 }
 
 type Firewall struct {
-	collection     *ebpf.Collection
-	blockedRules   *ebpf.Map
-	allowedRules   *ebpf.Map
-	globalBlock    *ebpf.Map
-	globalAllow    *ebpf.Map
-	currentLinks   map[string]link.Link     // XDP
-	currentTcLinks map[string]netlink.Qdisc // TC
-	rulesMutex     sync.Mutex
-	connectionMap  *ebpf.Map
-	analyzeLinks   map[string]link.Link
-	statsMutex     sync.RWMutex
+	collection        *ebpf.Collection
+	analyzeCollection *ebpf.Collection // Добавить это поле
+	blockedRules      *ebpf.Map
+	allowedRules      *ebpf.Map
+	globalBlock       *ebpf.Map
+	globalAllow       *ebpf.Map
+	currentLinks      map[string]link.Link
+	currentTcLinks    map[string]netlink.Qdisc
+	rulesMutex        sync.Mutex
+	connectionMap     *ebpf.Map
+	analyzeLinks      map[string]link.Link
+	statsMutex        sync.RWMutex
 }
 
 var firewall *Firewall
@@ -122,6 +123,25 @@ func main() {
 		log.Fatalf("Failed to initialize firewall: %v", err)
 	}
 	defer firewall.Close()
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("Warning: could not get network interfaces: %v", err)
+	}
+
+	// Прикрепляем анализатор ко всем активным интерфейсам (кроме loopback)
+	for _, iface := range interfaces {
+		// Пропускаем неактивные и loopback интерфейсы
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		if err := firewall.AttachAnalyzer(iface.Name); err != nil {
+			log.Printf("Warning: could not attach analyzer to %s: %v", iface.Name, err)
+		} else {
+			log.Printf("Successfully attached analyzer to interface: %s", iface.Name)
+		}
+	}
 
 	if err := firewall.LoadAndApplyRules(); err != nil {
 		log.Printf("Warning: could not load rules from file: %v", err)
@@ -170,15 +190,16 @@ func NewFirewall() (*Firewall, error) {
 	}
 
 	return &Firewall{
-		collection:     filterColl,
-		blockedRules:   blockedRules,
-		allowedRules:   allowedRules,
-		globalBlock:    globalBlock,
-		globalAllow:    globalAllow,
-		connectionMap:  connectionMap,
-		currentLinks:   make(map[string]link.Link),
-		currentTcLinks: make(map[string]netlink.Qdisc),
-		analyzeLinks:   make(map[string]link.Link),
+		collection:        filterColl,
+		analyzeCollection: analyzeColl, // Добавить это поле
+		blockedRules:      blockedRules,
+		allowedRules:      allowedRules,
+		globalBlock:       globalBlock,
+		globalAllow:       globalAllow,
+		connectionMap:     connectionMap,
+		currentLinks:      make(map[string]link.Link),
+		currentTcLinks:    make(map[string]netlink.Qdisc),
+		analyzeLinks:      make(map[string]link.Link),
 	}, nil
 }
 
@@ -195,7 +216,10 @@ func (fw *Firewall) AttachAnalyzer(ifaceName string) error {
 		return fmt.Errorf("interface not found: %s", err)
 	}
 
-	prog := fw.collection.Programs["analyze_connections"]
+	// Изменить эту строку: использовать analyzeColl вместо collection
+	// на:
+	prog := fw.analyzeCollection.Programs["analyze_connections"]
+
 	if prog == nil {
 		return fmt.Errorf("analyze_connections program not found")
 	}
