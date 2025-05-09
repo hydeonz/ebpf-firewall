@@ -37,15 +37,22 @@ const (
 	HTTPMethodGet  = "GET"
 )
 
+type ConnStats struct {
+	Count uint32
+	Bytes uint32
+}
+
 type ConnectionStats struct {
 	SourceIP   string    `json:"source_ip"`
 	Packets    uint32    `json:"packets"`
+	Bytes      uint32    `json:"bytes"`
 	LastUpdate time.Time `json:"last_update"`
 }
 
 type ConnectionsResponse struct {
 	Connections      []ConnectionStats `json:"connections"`
 	TotalConnections int               `json:"total_connections"`
+	TotalBytes       uint64            `json:"total_bytes"`
 	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
@@ -110,6 +117,7 @@ type Firewall struct {
 	currentTcLinks    map[string]netlink.Qdisc
 	rulesMutex        sync.Mutex
 	connectionMap     *ebpf.Map
+	totalBytes        *ebpf.Map // Добавляем эту строку
 	analyzeLinks      map[string]link.Link
 	statsMutex        sync.RWMutex
 }
@@ -181,9 +189,10 @@ func NewFirewall() (*Firewall, error) {
 	globalBlock := filterColl.Maps["global_block"]
 	globalAllow := filterColl.Maps["global_allow"]
 	connectionMap := analyzeColl.Maps["connection_map"]
+	totalBytes := analyzeColl.Maps["total_bytes"] // Добавляем эту строку
 
 	if blockedRules == nil || allowedRules == nil || globalBlock == nil ||
-		globalAllow == nil || connectionMap == nil {
+		globalAllow == nil || connectionMap == nil || totalBytes == nil { // Добавляем проверку
 		filterColl.Close()
 		analyzeColl.Close()
 		return nil, fmt.Errorf("required maps not found")
@@ -191,12 +200,13 @@ func NewFirewall() (*Firewall, error) {
 
 	return &Firewall{
 		collection:        filterColl,
-		analyzeCollection: analyzeColl, // Добавить это поле
+		analyzeCollection: analyzeColl,
 		blockedRules:      blockedRules,
 		allowedRules:      allowedRules,
 		globalBlock:       globalBlock,
 		globalAllow:       globalAllow,
 		connectionMap:     connectionMap,
+		totalBytes:        totalBytes, // Добавляем эту строку
 		currentLinks:      make(map[string]link.Link),
 		currentTcLinks:    make(map[string]netlink.Qdisc),
 		analyzeLinks:      make(map[string]link.Link),
@@ -247,9 +257,9 @@ func (fw *Firewall) GetConnectionStats() (*ConnectionsResponse, error) {
 		UpdatedAt:   time.Now(),
 	}
 
+	// Читаем статистику соединений
 	var key uint32
-	var value uint32
-
+	var value ConnStats
 	iter := fw.connectionMap.Iterate()
 	for iter.Next(&key, &value) {
 		ip := make(net.IP, 4)
@@ -257,9 +267,17 @@ func (fw *Firewall) GetConnectionStats() (*ConnectionsResponse, error) {
 
 		stats.Connections = append(stats.Connections, ConnectionStats{
 			SourceIP:   ip.String(),
-			Packets:    value,
+			Packets:    value.Count,
+			Bytes:      value.Bytes, // Добавляем поле Bytes
 			LastUpdate: time.Now(),
 		})
+	}
+
+	// Читаем общее количество байт
+	var totalKey uint32 = 0
+	var total uint64
+	if err := fw.totalBytes.Lookup(&totalKey, &total); err == nil {
+		stats.TotalBytes = total // Добавляем общее количество байт в ответ
 	}
 
 	stats.TotalConnections = len(stats.Connections)
@@ -284,10 +302,22 @@ func handleGetConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Add total bytes to the response
+	var totalBytes uint64
+	for _, conn := range stats.Connections {
+		totalBytes += uint64(conn.Bytes)
+	}
+
 	sendJSONResponse(w, http.StatusOK, ApiResponse{
 		Success: true,
 		Message: "Connection statistics retrieved successfully",
-		Data:    stats,
+		Data: struct {
+			*ConnectionsResponse
+			TotalBytes uint64 `json:"total_bytes"`
+		}{
+			ConnectionsResponse: stats,
+			TotalBytes:          totalBytes,
+		},
 	})
 }
 

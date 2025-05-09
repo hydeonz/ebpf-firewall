@@ -6,30 +6,57 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// Добавляем макрос для отладки
 #define bpf_debug(fmt, ...) \
     ({ char ____fmt[] = fmt; \
        bpf_trace_printk(____fmt, sizeof(____fmt), ##__VA_ARGS__); })
 
+struct conn_stats {
+    __u32 count;
+    __u32 bytes;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
+    __uint(value_size, sizeof(struct conn_stats));
     __uint(max_entries, 10000);
 } connection_map SEC(".maps");
+
+// Изменяем тип карты на ARRAY для total_bytes
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1);
+} total_bytes SEC(".maps");
 
 SEC("xdp")
 int analyze_connections(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
+    __u32 packet_length = data_end - data;
+
+    // Обновляем общее количество байт
+    __u32 key = 0;
+    __u64 *total = bpf_map_lookup_elem(&total_bytes, &key);
+    
+    if (!total) {
+        // Инициализируем если еще не существует
+        __u64 init_val = 0;
+        bpf_map_update_elem(&total_bytes, &key, &init_val, BPF_NOEXIST);
+        total = bpf_map_lookup_elem(&total_bytes, &key);
+        if (!total) {
+            return XDP_PASS;
+        }
+    }
+    
+    // Атомарное обновление счетчика
+    __sync_fetch_and_add(total, packet_length);
 
     struct ethhdr *eth = data;
     if ((void*)(eth + 1) > data_end)
         return XDP_PASS;
-
-    // Добавляем отладочный вывод для Ethernet
-    bpf_debug("Got packet, eth protocol: %x\n", bpf_ntohs(eth->h_proto));
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
@@ -38,9 +65,6 @@ int analyze_connections(struct xdp_md *ctx)
     if ((void*)(ip + 1) > data_end)
         return XDP_PASS;
 
-    // Добавляем отладочный вывод для IP
-    bpf_debug("IP protocol: %d, src: %x\n", ip->protocol, ip->saddr);
-
     if (ip->protocol != IPPROTO_TCP)
         return XDP_PASS;
 
@@ -48,22 +72,19 @@ int analyze_connections(struct xdp_md *ctx)
     if ((void*)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    // Добавляем отладочный вывод для TCP
-    bpf_debug("TCP src_port: %d, dst_port: %d\n", 
-              bpf_ntohs(tcp->source), bpf_ntohs(tcp->dest));
-
     __u32 src_ip = ip->saddr;
-    __u32 *count = bpf_map_lookup_elem(&connection_map, &src_ip);
-    __u32 new_count = 1;
+    struct conn_stats *stats = bpf_map_lookup_elem(&connection_map, &src_ip);
+    struct conn_stats new_stats = {
+        .count = 1,
+        .bytes = packet_length
+    };
 
-    if (count) {
-        new_count = *count + 1;
+    if (stats) {
+        new_stats.count = stats->count + 1;
+        new_stats.bytes = stats->bytes + packet_length;
     }
 
-    bpf_map_update_elem(&connection_map, &src_ip, &new_count, BPF_ANY);
-    
-    // Добавляем отладочный вывод для счетчика
-    bpf_debug("Updated connection count: %d\n", new_count);
+    bpf_map_update_elem(&connection_map, &src_ip, &new_stats, BPF_ANY);
 
     return XDP_PASS;
 }
