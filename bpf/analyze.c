@@ -73,7 +73,7 @@ int analyze_connections(struct xdp_md *ctx)
         return XDP_PASS;
 
     // работает в двух направлениях, можно сделать разбивку по входящему и исходящему трафику.
-    __u32 src_ip = ip->daddr;
+    __u32 src_ip = ip->saddr;
     struct conn_stats *stats = bpf_map_lookup_elem(&connection_map, &src_ip);
     struct conn_stats new_stats = {
         .count = 1,
