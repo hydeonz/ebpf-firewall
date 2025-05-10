@@ -186,3 +186,47 @@ Content-Type: application/json
   }
 }
 ```
+
+## GET /connections
+Content-Type: application/json
+
+Возвращает статистику сетевых соединений и SYN-пакетов.
+
+Ответ:
+
+**а) 200**
+
+
+```json
+{
+  "success": true,
+  "message": "Connection statistics retrieved successfully",
+  "data": {
+    "connections": [
+      {
+        "source_ip": "192.168.1.100",
+        "packets": 42,
+        "bytes": 10240,
+        "last_update": "2023-05-15T14:30:00Z"
+      },
+      {
+        "source_ip": "10.0.0.5",
+        "packets": 15,
+        "bytes": 5120,
+        "last_update": "2023-05-15T14:29:30Z"
+      }
+    ],
+    "total_connections": 2,
+    "total_bytes": 15360,
+    "updated_at": "2023-05-15T14:30:05Z"
+  }
+}
+```
+б) 500 - Ошибка сервера
+
+```json
+{
+  "success": false,
+  "message": "Failed to get connection stats: error description"
+}
+```
