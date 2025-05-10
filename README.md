@@ -186,11 +186,12 @@ Content-Type: application/json
   }
 }
 ```
+---
 
-## GET /connections
+### GET /connections
 Content-Type: application/json
 
-Возвращает статистику сетевых соединений и SYN-пакетов.
+Возвращает статистику сетевых соединений
 
 Ответ:
 
@@ -222,7 +223,7 @@ Content-Type: application/json
   }
 }
 ```
-б) 500 - Ошибка сервера
+б) 500
 
 ```json
 {
