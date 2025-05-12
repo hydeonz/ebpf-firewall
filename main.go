@@ -1015,6 +1015,39 @@ func handleGlobalAllow(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleGetInterfaces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != HTTPMethodGet {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
+			Success: false,
+			Message: "Method not allowed",
+		})
+		return
+	}
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get network interfaces: %v", err),
+		})
+		return
+	}
+
+	var result []map[string]interface{}
+	for _, iface := range interfaces {
+		result = append(result, map[string]interface{}{
+			"name":  iface.Name,
+			"is_up": iface.Flags&net.FlagUp != 0,
+		})
+	}
+
+	sendJSONResponse(w, http.StatusOK, ApiResponse{
+		Success: true,
+		Message: "Network interfaces retrieved successfully",
+		Data:    result,
+	})
+}
+
 func handleListRules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != HTTPMethodGet {
 		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
@@ -1099,8 +1132,7 @@ func setupHTTPServer() {
 	http.HandleFunc("/list-rules", handleListRules)
 	http.HandleFunc("/global-block", handleGlobalBlock)
 	http.HandleFunc("/global-allow", handleGlobalAllow)
-
-	// Новый обработчик для мониторинга соединений
+	http.HandleFunc("/interfaces", handleGetInterfaces)
 	http.HandleFunc("/connections", handleGetConnections)
 
 	go func() {

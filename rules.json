@@ -2,7 +2,7 @@
   "rules": [
     {
       "interface": "wlp3s0",
-      "ip": "192.168.2.33",
+      "ip": "1.1.1.1",
       "protocol": "icmp",
       "direction": "dst",
       "port": "any",
@@ -18,7 +18,7 @@
     },
     {
       "interface": "wlp3s0",
-      "ip": "1.1.1.1",
+      "ip": "192.168.2.33",
       "protocol": "icmp",
       "direction": "dst",
       "port": "any",

@@ -231,3 +231,43 @@ Content-Type: application/json
   "message": "Failed to get connection stats: error description"
 }
 ```
+
+### GET /interfaces
+Content-Type: application/json
+
+Возвращает текущие интерфейсы (активные и неактивные)
+
+Ответ:
+
+**а) 200 **
+
+```json
+{
+  "success": true,
+  "message": "Network interfaces retrieved successfully",
+  "data": [
+    {
+      "is_up": true,
+      "name": "lo"
+    },
+    {
+      "is_up": true,
+      "name": "enp2s0"
+    },
+    {
+      "is_up": true,
+      "name": "wlp3s0"
+    },
+    {
+      "is_up": true,
+      "name": "outline-tun0"
+    },
+    {
+      "is_up": true,
+      "name": "docker0"
+    }
+  ]
+}
+```
+
+
