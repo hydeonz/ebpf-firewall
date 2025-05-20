@@ -190,7 +190,6 @@ int xdp_filter_ip(struct xdp_md *ctx) {
         bpf_printk("ALLOWED INCOMING: Dst %pI4 Proto %d", &daddr, ip->protocol);
         return XDP_PASS;
     }
-
     // Проверяем глобальную блокировку (если включена, блокируем весь трафик)
     __u8 *global_block_enabled = bpf_map_lookup_elem(&global_block, &key);
     if (global_block_enabled && *global_block_enabled) {
