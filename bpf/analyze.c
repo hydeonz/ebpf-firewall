@@ -22,13 +22,29 @@ struct {
     __uint(max_entries, 10000);
 } connection_map SEC(".maps");
 
-// Изменяем тип карты на ARRAY для total_bytes
+// Мапа для общего количества байт
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(key_size, sizeof(__u32));
     __uint(value_size, sizeof(__u64));
     __uint(max_entries, 1);
 } total_bytes SEC(".maps");
+
+// Мапа для подсчета TCP_SYN (ключ 0)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1);
+} tcp_syn_count SEC(".maps");
+
+// Мапа для подсчета TCP_ACK (ключ 0)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u64));
+    __uint(max_entries, 1);
+} tcp_ack_count SEC(".maps");
 
 SEC("xdp")
 int analyze_connections(struct xdp_md *ctx)
@@ -40,7 +56,7 @@ int analyze_connections(struct xdp_md *ctx)
     // Обновляем общее количество байт
     __u32 key = 0;
     __u64 *total = bpf_map_lookup_elem(&total_bytes, &key);
-    
+
     if (!total) {
         // Инициализируем если еще не существует
         __u64 init_val = 0;
@@ -50,7 +66,7 @@ int analyze_connections(struct xdp_md *ctx)
             return XDP_PASS;
         }
     }
-    
+
     // Атомарное обновление счетчика
     __sync_fetch_and_add(total, packet_length);
 
@@ -71,6 +87,27 @@ int analyze_connections(struct xdp_md *ctx)
     struct tcphdr *tcp = (void*)(ip + 1);
     if ((void*)(tcp + 1) > data_end)
         return XDP_PASS;
+
+    // Проверяем TCP флаги
+    if (tcp->syn) {
+        __u64 *syn_count = bpf_map_lookup_elem(&tcp_syn_count, &key);
+        if (!syn_count) {
+            __u64 init_val = 1;
+            bpf_map_update_elem(&tcp_syn_count, &key, &init_val, BPF_NOEXIST);
+        } else {
+            __sync_fetch_and_add(syn_count, 1);
+        }
+    }
+
+    if (tcp->ack) {
+        __u64 *ack_count = bpf_map_lookup_elem(&tcp_ack_count, &key);
+        if (!ack_count) {
+            __u64 init_val = 1;
+            bpf_map_update_elem(&tcp_ack_count, &key, &init_val, BPF_NOEXIST);
+        } else {
+            __sync_fetch_and_add(ack_count, 1);
+        }
+    }
 
     // работает в двух направлениях, можно сделать разбивку по входящему и исходящему трафику.
     __u32 src_ip = ip->saddr;

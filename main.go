@@ -49,10 +49,16 @@ type ConnectionStats struct {
 	LastUpdate time.Time `json:"last_update"`
 }
 
+type TCPStats struct {
+	SYNCount uint64 `json:"syn_count"`
+	ACKCount uint64 `json:"ack_count"`
+}
+
 type ConnectionsResponse struct {
 	Connections      []ConnectionStats `json:"connections"`
 	TotalConnections int               `json:"total_connections"`
 	TotalBytes       uint64            `json:"total_bytes"`
+	TCPStats         TCPStats          `json:"tcp_stats"`
 	UpdatedAt        time.Time         `json:"updated_at"`
 }
 
@@ -108,7 +114,7 @@ type GlobalStatusResponse struct {
 
 type Firewall struct {
 	collection        *ebpf.Collection
-	analyzeCollection *ebpf.Collection // Добавить это поле
+	analyzeCollection *ebpf.Collection
 	blockedRules      *ebpf.Map
 	allowedRules      *ebpf.Map
 	globalBlock       *ebpf.Map
@@ -117,7 +123,9 @@ type Firewall struct {
 	currentTcLinks    map[string]netlink.Qdisc
 	rulesMutex        sync.Mutex
 	connectionMap     *ebpf.Map
-	totalBytes        *ebpf.Map // Добавляем эту строку
+	totalBytes        *ebpf.Map
+	tcpSynCount       *ebpf.Map // Добавляем карту для TCP SYN
+	tcpAckCount       *ebpf.Map // Добавляем карту для TCP ACK
 	analyzeLinks      map[string]link.Link
 	statsMutex        sync.RWMutex
 }
@@ -189,10 +197,13 @@ func NewFirewall() (*Firewall, error) {
 	globalBlock := filterColl.Maps["global_block"]
 	globalAllow := filterColl.Maps["global_allow"]
 	connectionMap := analyzeColl.Maps["connection_map"]
-	totalBytes := analyzeColl.Maps["total_bytes"] // Добавляем эту строку
+	totalBytes := analyzeColl.Maps["total_bytes"]
+	tcpSynCount := analyzeColl.Maps["tcp_syn_count"] // Получаем карту для TCP SYN
+	tcpAckCount := analyzeColl.Maps["tcp_ack_count"] // Получаем карту для TCP ACK
 
 	if blockedRules == nil || allowedRules == nil || globalBlock == nil ||
-		globalAllow == nil || connectionMap == nil || totalBytes == nil { // Добавляем проверку
+		globalAllow == nil || connectionMap == nil || totalBytes == nil ||
+		tcpSynCount == nil || tcpAckCount == nil {
 		filterColl.Close()
 		analyzeColl.Close()
 		return nil, fmt.Errorf("required maps not found")
@@ -206,7 +217,9 @@ func NewFirewall() (*Firewall, error) {
 		globalBlock:       globalBlock,
 		globalAllow:       globalAllow,
 		connectionMap:     connectionMap,
-		totalBytes:        totalBytes, // Добавляем эту строку
+		totalBytes:        totalBytes,
+		tcpSynCount:       tcpSynCount,
+		tcpAckCount:       tcpAckCount,
 		currentLinks:      make(map[string]link.Link),
 		currentTcLinks:    make(map[string]netlink.Qdisc),
 		analyzeLinks:      make(map[string]link.Link),
@@ -268,7 +281,7 @@ func (fw *Firewall) GetConnectionStats() (*ConnectionsResponse, error) {
 		stats.Connections = append(stats.Connections, ConnectionStats{
 			SourceIP:   ip.String(),
 			Packets:    value.Count,
-			Bytes:      value.Bytes, // Добавляем поле Bytes
+			Bytes:      value.Bytes,
 			LastUpdate: time.Now(),
 		})
 	}
@@ -277,48 +290,23 @@ func (fw *Firewall) GetConnectionStats() (*ConnectionsResponse, error) {
 	var totalKey uint32 = 0
 	var total uint64
 	if err := fw.totalBytes.Lookup(&totalKey, &total); err == nil {
-		stats.TotalBytes = total // Добавляем общее количество байт в ответ
+		stats.TotalBytes = total
+	}
+
+	// Читаем количество TCP SYN пакетов
+	var synCount uint64
+	if err := fw.tcpSynCount.Lookup(&totalKey, &synCount); err == nil {
+		stats.TCPStats.SYNCount = synCount
+	}
+
+	// Читаем количество TCP ACK пакетов
+	var ackCount uint64
+	if err := fw.tcpAckCount.Lookup(&totalKey, &ackCount); err == nil {
+		stats.TCPStats.ACKCount = ackCount
 	}
 
 	stats.TotalConnections = len(stats.Connections)
 	return stats, nil
-}
-
-func handleGetConnections(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodGet {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	stats, err := firewall.GetConnectionStats()
-	if err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get connection stats: %v", err),
-		})
-		return
-	}
-
-	// Add total bytes to the response
-	var totalBytes uint64
-	for _, conn := range stats.Connections {
-		totalBytes += uint64(conn.Bytes)
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: "Connection statistics retrieved successfully",
-		Data: struct {
-			*ConnectionsResponse
-			TotalBytes uint64 `json:"total_bytes"`
-		}{
-			ConnectionsResponse: stats,
-			TotalBytes:          totalBytes,
-		},
-	})
 }
 
 func (fw *Firewall) Close() {
@@ -725,6 +713,31 @@ func parseJSONRequest(r *http.Request, v interface{}) error {
 	}
 
 	return fmt.Errorf("content-type must be application/json")
+}
+
+func handleGetConnections(w http.ResponseWriter, r *http.Request) {
+	if r.Method != HTTPMethodGet {
+		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
+			Success: false,
+			Message: "Method not allowed",
+		})
+		return
+	}
+
+	stats, err := firewall.GetConnectionStats()
+	if err != nil {
+		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
+			Success: false,
+			Message: fmt.Sprintf("Failed to get connection stats: %v", err),
+		})
+		return
+	}
+
+	sendJSONResponse(w, http.StatusOK, ApiResponse{
+		Success: true,
+		Message: "Connection statistics retrieved successfully",
+		Data:    stats,
+	})
 }
 
 func handleAddRule(w http.ResponseWriter, r *http.Request) {
