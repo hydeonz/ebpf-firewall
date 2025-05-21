@@ -140,25 +140,6 @@ func main() {
 	}
 	defer firewall.Close()
 
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		log.Printf("Warning: could not get network interfaces: %v", err)
-	}
-
-	// Прикрепляем анализатор ко всем активным интерфейсам (кроме loopback)
-	for _, iface := range interfaces {
-		// Пропускаем неактивные и loopback интерфейсы
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		if err := firewall.AttachAnalyzer(iface.Name); err != nil {
-			log.Printf("Warning: could not attach analyzer to %s: %v", iface.Name, err)
-		} else {
-			log.Printf("Successfully attached analyzer to interface: %s", iface.Name)
-		}
-	}
-
 	if err := firewall.LoadAndApplyRules(); err != nil {
 		log.Printf("Warning: could not load rules from file: %v", err)
 	}
@@ -169,96 +150,47 @@ func main() {
 
 func NewFirewall() (*Firewall, error) {
 	// Загружаем фильтр
-	filterSpec, err := ebpf.LoadCollectionSpec("bpf/filter.o")
+	spec, err := ebpf.LoadCollectionSpec("bpf/filter.o")
 	if err != nil {
-		return nil, fmt.Errorf("failed to load filter spec: %v", err)
+		return nil, fmt.Errorf("failed to load combined spec: %v", err)
 	}
 
-	// Загружаем анализатор
-	analyzeSpec, err := ebpf.LoadCollectionSpec("bpf/analyze.o")
+	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load analyze spec: %v", err)
-	}
-
-	filterColl, err := ebpf.NewCollection(filterSpec)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create filter collection: %v", err)
-	}
-
-	analyzeColl, err := ebpf.NewCollection(analyzeSpec)
-	if err != nil {
-		filterColl.Close()
-		return nil, fmt.Errorf("failed to create analyze collection: %v", err)
+		return nil, fmt.Errorf("failed to create combined collection: %v", err)
 	}
 
 	// Получаем карты
-	blockedRules := filterColl.Maps["blocked_rules"]
-	allowedRules := filterColl.Maps["allowed_rules"]
-	globalBlock := filterColl.Maps["global_block"]
-	globalAllow := filterColl.Maps["global_allow"]
-	connectionMap := analyzeColl.Maps["connection_map"]
-	totalBytes := analyzeColl.Maps["total_bytes"]
-	tcpSynCount := analyzeColl.Maps["tcp_syn_count"] // Получаем карту для TCP SYN
-	tcpAckCount := analyzeColl.Maps["tcp_ack_count"] // Получаем карту для TCP ACK
+	blockedRules := coll.Maps["blocked_rules"]
+	allowedRules := coll.Maps["allowed_rules"]
+	globalBlock := coll.Maps["global_block"]
+	globalAllow := coll.Maps["global_allow"]
+	connectionMap := coll.Maps["connection_map"]
+	totalBytes := coll.Maps["total_bytes"]
+	tcpSynCount := coll.Maps["tcp_syn_count"] // Получаем карту для TCP SYN
+	tcpAckCount := coll.Maps["tcp_ack_count"] // Получаем карту для TCP ACK
 
 	if blockedRules == nil || allowedRules == nil || globalBlock == nil ||
 		globalAllow == nil || connectionMap == nil || totalBytes == nil ||
 		tcpSynCount == nil || tcpAckCount == nil {
-		filterColl.Close()
-		analyzeColl.Close()
+		coll.Close()
 		return nil, fmt.Errorf("required maps not found")
 	}
 
 	return &Firewall{
-		collection:        filterColl,
-		analyzeCollection: analyzeColl,
-		blockedRules:      blockedRules,
-		allowedRules:      allowedRules,
-		globalBlock:       globalBlock,
-		globalAllow:       globalAllow,
-		connectionMap:     connectionMap,
-		totalBytes:        totalBytes,
-		tcpSynCount:       tcpSynCount,
-		tcpAckCount:       tcpAckCount,
-		currentLinks:      make(map[string]link.Link),
-		currentTcLinks:    make(map[string]netlink.Qdisc),
-		analyzeLinks:      make(map[string]link.Link),
+		collection:     coll,
+		blockedRules:   blockedRules,
+		allowedRules:   allowedRules,
+		globalBlock:    globalBlock,
+		globalAllow:    globalAllow,
+		connectionMap:  connectionMap,
+		totalBytes:     totalBytes,
+		tcpSynCount:    tcpSynCount,
+		tcpAckCount:    tcpAckCount,
+		currentLinks:   make(map[string]link.Link),
+		currentTcLinks: make(map[string]netlink.Qdisc),
+		analyzeLinks:   make(map[string]link.Link),
 	}, nil
-}
-
-func (fw *Firewall) AttachAnalyzer(ifaceName string) error {
-	fw.statsMutex.Lock()
-	defer fw.statsMutex.Unlock()
-
-	if _, exists := fw.analyzeLinks[ifaceName]; exists {
-		return nil
-	}
-
-	iface, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		return fmt.Errorf("interface not found: %s", err)
-	}
-
-	// Изменить эту строку: использовать analyzeColl вместо collection
-	// на:
-	prog := fw.analyzeCollection.Programs["analyze_connections"]
-
-	if prog == nil {
-		return fmt.Errorf("analyze_connections program not found")
-	}
-
-	opts := link.XDPOptions{
-		Program:   prog,
-		Interface: iface.Index,
-	}
-
-	lnk, err := link.AttachXDP(opts)
-	if err != nil {
-		return fmt.Errorf("failed to attach analyzer: %v", err)
-	}
-
-	fw.analyzeLinks[ifaceName] = lnk
-	return nil
 }
 
 func (fw *Firewall) GetConnectionStats() (*ConnectionsResponse, error) {
@@ -440,7 +372,7 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 	if rule.Direction == DirectionSrc {
 		if _, exists := fw.currentLinks[rule.Interface]; !exists {
 			opts := link.XDPOptions{
-				Program:   fw.collection.Programs["xdp_filter_ip"],
+				Program:   fw.collection.Programs["xdp_filter_analyze"],
 				Interface: iface.Index,
 			}
 			lnk, err := link.AttachXDP(opts)
