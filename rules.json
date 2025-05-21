@@ -1,6 +1,13 @@
 {
   "rules": [
-
+    {
+      "interface": "wlp3s0",
+      "ip": "8.8.8.8",
+      "protocol": "icmp",
+      "direction": "src",
+      "port": "any",
+      "action": "allow"
+    }
   ],
   "global_block": false,
   "global_allow": false
