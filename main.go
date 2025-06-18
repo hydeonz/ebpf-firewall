@@ -12,21 +12,16 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
-	"time"
-
-	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 )
 
-// Константы
+// Constants
 const (
 	RulesFile      = "rules.json"
 	ServerPort     = ":8080"
 	AnyPort        = "any"
-	DirectionSrc   = "src"
-	DirectionDst   = "dst"
 	ProtocolICMP   = "icmp"
 	ProtocolTCP    = "tcp"
 	ProtocolUDP    = "udp"
@@ -37,97 +32,61 @@ const (
 	HTTPMethodGet  = "GET"
 )
 
-type ConnStats struct {
-	Count uint32
-	Bytes uint32
-}
-
-type ConnectionStats struct {
-	SourceIP   string    `json:"source_ip"`
-	Packets    uint32    `json:"packets"`
-	Bytes      uint32    `json:"bytes"`
-	LastUpdate time.Time `json:"last_update"`
-}
-
-type TCPStats struct {
-	SYNCount uint64 `json:"syn_count"`
-	ACKCount uint64 `json:"ack_count"`
-}
-
-type ConnectionsResponse struct {
-	Connections      []ConnectionStats `json:"connections"`
-	TotalConnections int               `json:"total_connections"`
-	TotalBytes       uint64            `json:"total_bytes"`
-	TCPStats         TCPStats          `json:"tcp_stats"`
-	UpdatedAt        time.Time         `json:"updated_at"`
-}
-
-// Структуры запросов и ответов
-type RuleRequest struct {
-	Interface string `json:"interface"`
-	IP        string `json:"ip"`
-	Protocol  string `json:"protocol"`
-	Direction string `json:"direction"`
-	Port      string `json:"port"`
-	Action    string `json:"action"`
-}
-
+// RuleKey matches the C struct rule_key
 type RuleKey struct {
-	IP        uint32 `json:"ip"`
-	Proto     uint8  `json:"proto"`
-	Direction uint8  `json:"direction"`
-	Port      uint16 `json:"port"`
+	SrcIP   uint32 `json:"src_ip"`
+	DstIP   uint32 `json:"dst_ip"`
+	Proto   uint8  `json:"proto"`
+	SrcPort uint16 `json:"src_port"`
+	DstPort uint16 `json:"dst_port"`
 }
 
+// SavedRule represents a rule as saved in JSON
 type SavedRule struct {
 	Interface string `json:"interface"`
-	IP        string `json:"ip"`
+	SrcIP     string `json:"src_ip"`
+	DstIP     string `json:"dst_ip"`
 	Protocol  string `json:"protocol"`
-	Direction string `json:"direction"`
-	Port      string `json:"port"`
+	SrcPort   string `json:"src_port"`
+	DstPort   string `json:"dst_port"`
 	Action    string `json:"action"`
 }
 
+// RulesFileFormat represents the structure of the rules file
 type RulesFileFormat struct {
 	Rules       []SavedRule `json:"rules"`
 	GlobalBlock bool        `json:"global_block"`
 	GlobalAllow bool        `json:"global_allow"`
 }
 
-// Структуры ответов API
+// ApiResponse is the standard API response structure
 type ApiResponse struct {
 	Success bool        `json:"success"`
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
+// ListRulesResponse is the response for listing rules
 type ListRulesResponse struct {
 	GlobalBlock bool        `json:"global_block"`
 	GlobalAllow bool        `json:"global_allow"`
 	Rules       []SavedRule `json:"rules"`
 }
 
+// GlobalStatusResponse shows global rule status
 type GlobalStatusResponse struct {
 	Enabled bool   `json:"enabled"`
 	Type    string `json:"type"`
 }
 
+// Firewall holds the eBPF programs and maps
 type Firewall struct {
-	collection        *ebpf.Collection
-	analyzeCollection *ebpf.Collection
-	blockedRules      *ebpf.Map
-	allowedRules      *ebpf.Map
-	globalBlock       *ebpf.Map
-	globalAllow       *ebpf.Map
-	currentLinks      map[string]link.Link
-	currentTcLinks    map[string]netlink.Qdisc
-	rulesMutex        sync.Mutex
-	connectionMap     *ebpf.Map
-	totalBytes        *ebpf.Map
-	tcpSynCount       *ebpf.Map // Добавляем карту для TCP SYN
-	tcpAckCount       *ebpf.Map // Добавляем карту для TCP ACK
-	analyzeLinks      map[string]link.Link
-	statsMutex        sync.RWMutex
+	collection    *ebpf.Collection
+	firewallRules *ebpf.Map
+	globalBlock   *ebpf.Map
+	globalAllow   *ebpf.Map
+	currentLinks  map[string]link.Link
+	rulesMutex    sync.Mutex
 }
 
 var firewall *Firewall
@@ -149,152 +108,45 @@ func main() {
 }
 
 func NewFirewall() (*Firewall, error) {
-	// Загружаем фильтр
+	// Load the compiled eBPF ELF file
 	spec, err := ebpf.LoadCollectionSpec("bpf/filter.o")
 	if err != nil {
-		return nil, fmt.Errorf("failed to load combined spec: %v", err)
+		return nil, fmt.Errorf("failed to load spec: %v", err)
 	}
 
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create combined collection: %v", err)
+		return nil, fmt.Errorf("failed to create collection: %v", err)
 	}
 
-	// Получаем карты
-	blockedRules := coll.Maps["blocked_rules"]
-	allowedRules := coll.Maps["allowed_rules"]
+	// Get the maps
+	firewallRules := coll.Maps["firewall_rules"]
 	globalBlock := coll.Maps["global_block"]
 	globalAllow := coll.Maps["global_allow"]
-	connectionMap := coll.Maps["connection_map"]
-	totalBytes := coll.Maps["total_bytes"]
-	tcpSynCount := coll.Maps["tcp_syn_count"] // Получаем карту для TCP SYN
-	tcpAckCount := coll.Maps["tcp_ack_count"] // Получаем карту для TCP ACK
 
-	if blockedRules == nil || allowedRules == nil || globalBlock == nil ||
-		globalAllow == nil || connectionMap == nil || totalBytes == nil ||
-		tcpSynCount == nil || tcpAckCount == nil {
+	if firewallRules == nil || globalBlock == nil || globalAllow == nil {
 		coll.Close()
 		return nil, fmt.Errorf("required maps not found")
 	}
 
 	return &Firewall{
-		collection:     coll,
-		blockedRules:   blockedRules,
-		allowedRules:   allowedRules,
-		globalBlock:    globalBlock,
-		globalAllow:    globalAllow,
-		connectionMap:  connectionMap,
-		totalBytes:     totalBytes,
-		tcpSynCount:    tcpSynCount,
-		tcpAckCount:    tcpAckCount,
-		currentLinks:   make(map[string]link.Link),
-		currentTcLinks: make(map[string]netlink.Qdisc),
-		analyzeLinks:   make(map[string]link.Link),
+		collection:    coll,
+		firewallRules: firewallRules,
+		globalBlock:   globalBlock,
+		globalAllow:   globalAllow,
+		currentLinks:  make(map[string]link.Link),
 	}, nil
 }
 
-func (fw *Firewall) GetConnectionStats() (*ConnectionsResponse, error) {
-	fw.statsMutex.RLock()
-	defer fw.statsMutex.RUnlock()
-
-	stats := &ConnectionsResponse{
-		Connections: make([]ConnectionStats, 0),
-		UpdatedAt:   time.Now(),
-	}
-
-	// Читаем статистику соединений
-	var key uint32
-	var value ConnStats
-	iter := fw.connectionMap.Iterate()
-	for iter.Next(&key, &value) {
-		ip := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ip, key)
-
-		stats.Connections = append(stats.Connections, ConnectionStats{
-			SourceIP:   ip.String(),
-			Packets:    value.Count,
-			Bytes:      value.Bytes,
-			LastUpdate: time.Now(),
-		})
-	}
-
-	// Читаем общее количество байт
-	var totalKey uint32 = 0
-	var total uint64
-	if err := fw.totalBytes.Lookup(&totalKey, &total); err == nil {
-		stats.TotalBytes = total
-	}
-
-	// Читаем количество TCP SYN пакетов
-	var synCount uint64
-	if err := fw.tcpSynCount.Lookup(&totalKey, &synCount); err == nil {
-		stats.TCPStats.SYNCount = synCount
-	}
-
-	// Читаем количество TCP ACK пакетов
-	var ackCount uint64
-	if err := fw.tcpAckCount.Lookup(&totalKey, &ackCount); err == nil {
-		stats.TCPStats.ACKCount = ackCount
-	}
-
-	stats.TotalConnections = len(stats.Connections)
-	return stats, nil
-}
-
 func (fw *Firewall) Close() {
-	// Закрываем все XDP линки
+	// Close all XDP links
 	for iface, lnk := range fw.currentLinks {
 		if err := lnk.Close(); err != nil {
 			log.Printf("Failed to close XDP link for interface %s: %v", iface, err)
 		}
 	}
 
-	// Удаляем все TC фильтры и qdisc
-	for iface := range fw.currentTcLinks {
-		ifaceObj, err := net.InterfaceByName(iface)
-		if err != nil {
-			log.Printf("Failed to get interface %s: %v", iface, err)
-			continue
-		}
-
-		// Сначала удаляем фильтры
-		filters, err := netlink.FilterList(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{
-			Index: ifaceObj.Index,
-		}}, netlink.HANDLE_MIN_EGRESS)
-		if err != nil {
-			log.Printf("Failed to list filters for interface %s: %v", iface, err)
-			continue
-		}
-
-		for _, filter := range filters {
-			if bpfFilter, ok := filter.(*netlink.BpfFilter); ok {
-				if err := netlink.FilterDel(bpfFilter); err != nil {
-					log.Printf("Failed to delete BPF filter on interface %s: %v", iface, err)
-				}
-			}
-		}
-
-		// Затем удаляем qdisc clsact
-		qdisc := &netlink.GenericQdisc{
-			QdiscAttrs: netlink.QdiscAttrs{
-				LinkIndex: ifaceObj.Index,
-				Handle:    netlink.MakeHandle(0xffff, 0),
-				Parent:    netlink.HANDLE_CLSACT,
-			},
-			QdiscType: "clsact",
-		}
-
-		// Пробуем удалить с разными родительскими handles
-		if err := netlink.QdiscDel(qdisc); err != nil {
-			// Пробуем альтернативный вариант
-			qdisc.Parent = netlink.HANDLE_INGRESS
-			if err := netlink.QdiscDel(qdisc); err != nil {
-				log.Printf("Failed to delete qdisc on interface %s: %v", iface, err)
-			}
-		}
-	}
-
-	// Закрываем коллекцию eBPF
+	// Close the eBPF collection
 	fw.collection.Close()
 }
 
@@ -304,7 +156,7 @@ func (fw *Firewall) SetGlobalBlock(enabled bool) error {
 	if enabled {
 		value = 1
 	}
-	// Если включаем глобальную блокировку, выключаем глобальное разрешение
+	// If enabling global block, disable global allow
 	if enabled {
 		if err := fw.globalAllow.Put(key, uint8(0)); err != nil {
 			return err
@@ -319,7 +171,7 @@ func (fw *Firewall) SetGlobalAllow(enabled bool) error {
 	if enabled {
 		value = 1
 	}
-	// Если включаем глобальное разрешение, выключаем глобальную блокировку
+	// If enabling global allow, disable global block
 	if enabled {
 		if err := fw.globalBlock.Put(key, uint8(0)); err != nil {
 			return err
@@ -329,9 +181,16 @@ func (fw *Firewall) SetGlobalAllow(enabled bool) error {
 }
 
 func (fw *Firewall) ApplyRule(rule SavedRule) error {
-	ip := net.ParseIP(rule.IP).To4()
-	if ip == nil {
-		return fmt.Errorf("invalid IP: %s", rule.IP)
+	// Parse source IP
+	srcIP := net.ParseIP(rule.SrcIP).To4()
+	if srcIP == nil && rule.SrcIP != "" {
+		return fmt.Errorf("invalid source IP: %s", rule.SrcIP)
+	}
+
+	// Parse destination IP
+	dstIP := net.ParseIP(rule.DstIP).To4()
+	if dstIP == nil && rule.DstIP != "" {
+		return fmt.Errorf("invalid destination IP: %s", rule.DstIP)
 	}
 
 	protoNum, err := protocolToNumber(rule.Protocol)
@@ -339,126 +198,98 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 		return err
 	}
 
-	portNum, err := portToNumber(rule.Port)
+	srcPort, err := portToNumber(rule.SrcPort)
 	if err != nil {
 		return err
 	}
 
-	dirNum := directionToNumber(rule.Direction)
-	ipVal := binary.LittleEndian.Uint32(ip)
-
-	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
-
-	var targetMap *ebpf.Map
-	switch rule.Action {
-	case ActionBlock:
-		targetMap = fw.blockedRules
-	case ActionAllow:
-		targetMap = fw.allowedRules
-	default:
-		return fmt.Errorf("invalid action: %s", rule.Action)
+	dstPort, err := portToNumber(rule.DstPort)
+	if err != nil {
+		return err
 	}
 
-	if err := targetMap.Put(key, uint8(1)); err != nil {
+	// Create rule key
+	key := RuleKey{
+		SrcIP:   binary.LittleEndian.Uint32(srcIP),
+		DstIP:   binary.LittleEndian.Uint32(dstIP),
+		Proto:   protoNum,
+		SrcPort: srcPort,
+		DstPort: dstPort,
+	}
+
+	// Set value in the map (1 = allow, 0 = block)
+	var value uint8
+	if rule.Action == ActionAllow {
+		value = 1
+	}
+
+	if err := fw.firewallRules.Put(key, value); err != nil {
 		return fmt.Errorf("failed to insert into BPF map: %v", err)
 	}
 
-	iface, err := net.InterfaceByName(rule.Interface)
-	if err != nil {
-		return fmt.Errorf("interface not found: %s", rule.Interface)
+	// Attach XDP program if not already attached
+	if _, exists := fw.currentLinks[rule.Interface]; !exists {
+		iface, err := net.InterfaceByName(rule.Interface)
+		if err != nil {
+			return fmt.Errorf("interface not found: %s", rule.Interface)
+		}
+
+		opts := link.XDPOptions{
+			Program:   fw.collection.Programs["xdp_firewall"],
+			Interface: iface.Index,
+		}
+		lnk, err := link.AttachXDP(opts)
+		if err != nil {
+			return fmt.Errorf("failed to attach XDP: %v", err)
+		}
+		fw.currentLinks[rule.Interface] = lnk
 	}
 
-	// Attach XDP (ingress) only once
-	if rule.Direction == DirectionSrc {
-		if _, exists := fw.currentLinks[rule.Interface]; !exists {
-			opts := link.XDPOptions{
-				Program:   fw.collection.Programs["xdp_filter_analyze"],
-				Interface: iface.Index,
-			}
-			lnk, err := link.AttachXDP(opts)
-			if err != nil {
-				return fmt.Errorf("failed to attach XDP: %v", err)
-			}
-			fw.currentLinks[rule.Interface] = lnk
-		}
-	} else if rule.Direction == DirectionDst {
-		if _, exists := fw.currentTcLinks[rule.Interface]; !exists {
-			qdisc := &netlink.GenericQdisc{
-				QdiscAttrs: netlink.QdiscAttrs{
-					LinkIndex: iface.Index,
-					Handle:    netlink.MakeHandle(1, 0),
-					Parent:    netlink.HANDLE_CLSACT,
-				},
-				QdiscType: "clsact",
-			}
-			if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) {
-				return fmt.Errorf("failed to add qdisc: %v", err)
-			}
-
-			prog := fw.collection.Programs["tc_egress_filter"]
-			if prog == nil {
-				return fmt.Errorf("TC program not found in collection")
-			}
-
-			filter := &netlink.BpfFilter{
-				FilterAttrs: netlink.FilterAttrs{
-					LinkIndex: iface.Index,
-					Parent:    netlink.HANDLE_MIN_EGRESS,
-					Handle:    netlink.MakeHandle(1, 0),
-					Priority:  1,
-					Protocol:  syscall.ETH_P_ALL,
-				},
-				Fd:           prog.FD(),
-				Name:         "tc_egress_filter",
-				DirectAction: true,
-			}
-
-			if err := netlink.FilterAdd(filter); err != nil {
-				return fmt.Errorf("failed to attach BPF filter with netlink: %v", err)
-			}
-
-			fw.currentTcLinks[rule.Interface] = qdisc
-		}
-	}
 	return nil
 }
 
-func (fw *Firewall) RemoveRule(rr RuleRequest) error {
-	ip := net.ParseIP(rr.IP).To4()
-	if ip == nil {
-		return fmt.Errorf("invalid IPv4 address")
+func (fw *Firewall) RemoveRule(rule SavedRule) error {
+	// Parse source IP
+	srcIP := net.ParseIP(rule.SrcIP).To4()
+	if srcIP == nil && rule.SrcIP != "" {
+		return fmt.Errorf("invalid source IP: %s", rule.SrcIP)
 	}
 
-	protoNum, err := protocolToNumber(rr.Protocol)
+	// Parse destination IP
+	dstIP := net.ParseIP(rule.DstIP).To4()
+	if dstIP == nil && rule.DstIP != "" {
+		return fmt.Errorf("invalid destination IP: %s", rule.DstIP)
+	}
+
+	protoNum, err := protocolToNumber(rule.Protocol)
 	if err != nil {
 		return err
 	}
 
-	portNum, err := portToNumber(rr.Port)
+	srcPort, err := portToNumber(rule.SrcPort)
 	if err != nil {
 		return err
 	}
 
-	dirNum := directionToNumber(rr.Direction)
-	ipVal := binary.LittleEndian.Uint32(ip)
-
-	key := RuleKey{IP: ipVal, Proto: protoNum, Direction: dirNum, Port: portNum}
-
-	var targetMap *ebpf.Map
-	switch rr.Action {
-	case ActionBlock:
-		targetMap = fw.blockedRules
-	case ActionAllow:
-		targetMap = fw.allowedRules
-	default:
-		return fmt.Errorf("invalid action: %s", rr.Action)
+	dstPort, err := portToNumber(rule.DstPort)
+	if err != nil {
+		return err
 	}
 
-	if err := targetMap.Delete(key); err != nil {
+	// Create rule key
+	key := RuleKey{
+		SrcIP:   binary.LittleEndian.Uint32(srcIP),
+		DstIP:   binary.LittleEndian.Uint32(dstIP),
+		Proto:   protoNum,
+		SrcPort: srcPort,
+		DstPort: dstPort,
+	}
+
+	if err := fw.firewallRules.Delete(key); err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("rule not found in %s rules", rr.Action)
+			return fmt.Errorf("rule not found")
 		}
-		return fmt.Errorf("failed to remove from %s rules: %v", rr.Action, err)
+		return fmt.Errorf("failed to remove rule: %v", err)
 	}
 
 	return nil
@@ -515,81 +346,49 @@ func (fw *Firewall) saveRulesToFile() error {
 
 	var rules []SavedRule
 
-	// Сохраняем блокирующие правила
-	iter := fw.blockedRules.Iterate()
+	// Iterate through all rules in the BPF map
+	iter := fw.firewallRules.Iterate()
 	var key RuleKey
 	var value uint8
 
 	for iter.Next(&key, &value) {
-		ip := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ip, key.IP)
-		rule := SavedRule{
-			IP:        ip.String(),
-			Protocol:  numberToProtocol(key.Proto),
-			Direction: DirectionSrc,
-			Port:      AnyPort,
-			Action:    ActionBlock,
-		}
-		if key.Direction == 1 {
-			rule.Direction = DirectionDst
-		}
-		if key.Port != 0 {
-			rule.Port = strconv.Itoa(int(key.Port))
+		srcIP := make(net.IP, 4)
+		binary.LittleEndian.PutUint32(srcIP, key.SrcIP)
+
+		dstIP := make(net.IP, 4)
+		binary.LittleEndian.PutUint32(dstIP, key.DstIP)
+
+		action := ActionBlock
+		if value == 1 {
+			action = ActionAllow
 		}
 
-		// Находим интерфейс для этого правила
-		for ifaceName, lnk := range fw.currentLinks {
-			if lnk != nil {
-				rule.Interface = ifaceName
-				break
-			}
+		rule := SavedRule{
+			SrcIP:    srcIP.String(),
+			DstIP:    dstIP.String(),
+			Protocol: numberToProtocol(key.Proto),
+			SrcPort:  AnyPort,
+			DstPort:  AnyPort,
+			Action:   action,
 		}
-		if rule.Interface == "" {
-			for ifaceName := range fw.currentTcLinks {
-				rule.Interface = ifaceName
-				break
-			}
+
+		if key.SrcPort != 0 {
+			rule.SrcPort = strconv.Itoa(int(key.SrcPort))
+		}
+		if key.DstPort != 0 {
+			rule.DstPort = strconv.Itoa(int(key.DstPort))
+		}
+
+		// Find the interface for this rule
+		for ifaceName := range fw.currentLinks {
+			rule.Interface = ifaceName
+			break
 		}
 
 		rules = append(rules, rule)
 	}
 
-	// Сохраняем разрешающие правила
-	iter = fw.allowedRules.Iterate()
-	for iter.Next(&key, &value) {
-		ip := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ip, key.IP)
-		rule := SavedRule{
-			IP:        ip.String(),
-			Protocol:  numberToProtocol(key.Proto),
-			Direction: DirectionSrc,
-			Port:      AnyPort,
-			Action:    ActionAllow,
-		}
-		if key.Direction == 1 {
-			rule.Direction = DirectionDst
-		}
-		if key.Port != 0 {
-			rule.Port = strconv.Itoa(int(key.Port))
-		}
-
-		for ifaceName, lnk := range fw.currentLinks {
-			if lnk != nil {
-				rule.Interface = ifaceName
-				break
-			}
-		}
-		if rule.Interface == "" {
-			for ifaceName := range fw.currentTcLinks {
-				rule.Interface = ifaceName
-				break
-			}
-		}
-
-		rules = append(rules, rule)
-	}
-
-	// Получаем текущие глобальные настройки
+	// Get current global settings
 	var globalBlockVal, globalAllowVal uint8
 	if err := fw.globalBlock.Lookup(uint8(0), &globalBlockVal); err != nil {
 		return fmt.Errorf("failed to get global block status: %v", err)
@@ -621,7 +420,7 @@ func (fw *Firewall) saveRulesToFile() error {
 	return nil
 }
 
-// Вспомогательная функция для отправки JSON-ответов
+// Helper functions for API responses
 func sendJSONResponse(w http.ResponseWriter, status int, response interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -630,11 +429,8 @@ func sendJSONResponse(w http.ResponseWriter, status int, response interface{}) {
 	}
 }
 
-// Функция для обработки запросов в формате JSON
 func parseJSONRequest(r *http.Request, v interface{}) error {
 	contentType := r.Header.Get("Content-Type")
-
-	// Проверяем, что запрос в формате JSON
 	if contentType == "application/json" {
 		decoder := json.NewDecoder(r.Body)
 		defer r.Body.Close()
@@ -643,35 +439,10 @@ func parseJSONRequest(r *http.Request, v interface{}) error {
 		}
 		return nil
 	}
-
 	return fmt.Errorf("content-type must be application/json")
 }
 
-func handleGetConnections(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodGet {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	stats, err := firewall.GetConnectionStats()
-	if err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get connection stats: %v", err),
-		})
-		return
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: "Connection statistics retrieved successfully",
-		Data:    stats,
-	})
-}
-
+// HTTP handlers
 func handleAddRule(w http.ResponseWriter, r *http.Request) {
 	if r.Method != HTTPMethodPost {
 		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
@@ -681,57 +452,37 @@ func handleAddRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var rr RuleRequest
-
-	// Проверяем, является ли запрос JSON-запросом
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "application/json" {
-		if err := parseJSONRequest(r, &rr); err != nil {
-			sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-				Success: false,
-				Message: fmt.Sprintf("Error parsing request: %v", err),
-			})
-			return
-		}
-	} else {
-		// Обработка form-data запросов для обратной совместимости
-		rr = RuleRequest{
-			Interface: r.FormValue("interface"),
-			IP:        r.FormValue("ip"),
-			Protocol:  r.FormValue("protocol"),
-			Direction: r.FormValue("direction"),
-			Port:      r.FormValue("port"),
-			Action:    r.FormValue("action"),
-		}
-	}
-
-	if rr.Interface == "" || rr.IP == "" || rr.Protocol == "" || rr.Direction == "" || rr.Action == "" {
+	var rule SavedRule
+	if err := parseJSONRequest(r, &rule); err != nil {
 		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
 			Success: false,
-			Message: "interface, ip, protocol, direction and action parameters are required",
+			Message: fmt.Sprintf("Error parsing request: %v", err),
 		})
 		return
 	}
 
-	if rr.Port == "" {
-		rr.Port = AnyPort
+	// Validate required fields
+	if rule.Interface == "" || rule.SrcIP == "" || rule.DstIP == "" || rule.Protocol == "" || rule.Action == "" {
+		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
+			Success: false,
+			Message: "interface, src_ip, dst_ip, protocol and action parameters are required",
+		})
+		return
 	}
 
-	if rr.Action != ActionBlock && rr.Action != ActionAllow {
+	if rule.SrcPort == "" {
+		rule.SrcPort = AnyPort
+	}
+	if rule.DstPort == "" {
+		rule.DstPort = AnyPort
+	}
+
+	if rule.Action != ActionBlock && rule.Action != ActionAllow {
 		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
 			Success: false,
 			Message: "action must be either 'block' or 'allow'",
 		})
 		return
-	}
-
-	rule := SavedRule{
-		Interface: rr.Interface,
-		IP:        rr.IP,
-		Protocol:  rr.Protocol,
-		Direction: rr.Direction,
-		Port:      rr.Port,
-		Action:    rr.Action,
 	}
 
 	if err := firewall.ApplyRule(rule); err != nil {
@@ -752,8 +503,8 @@ func handleAddRule(w http.ResponseWriter, r *http.Request) {
 
 	sendJSONResponse(w, http.StatusOK, ApiResponse{
 		Success: true,
-		Message: fmt.Sprintf("Successfully %sed %s %s traffic for IP: %s, port: %s on interface %s",
-			rr.Action, rr.Direction, rr.Protocol, rr.IP, rr.Port, rr.Interface),
+		Message: fmt.Sprintf("Successfully %sed traffic from %s:%s to %s:%s (%s) on interface %s",
+			rule.Action, rule.SrcIP, rule.SrcPort, rule.DstIP, rule.DstPort, rule.Protocol, rule.Interface),
 		Data: rule,
 	})
 }
@@ -767,43 +518,31 @@ func handleRemoveRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var rr RuleRequest
-
-	// Проверяем, является ли запрос JSON-запросом
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "application/json" {
-		if err := parseJSONRequest(r, &rr); err != nil {
-			sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-				Success: false,
-				Message: fmt.Sprintf("Error parsing request: %v", err),
-			})
-			return
-		}
-	} else {
-		// Обработка form-data запросов для обратной совместимости
-		rr = RuleRequest{
-			Interface: r.FormValue("interface"),
-			IP:        r.FormValue("ip"),
-			Protocol:  r.FormValue("protocol"),
-			Direction: r.FormValue("direction"),
-			Port:      r.FormValue("port"),
-			Action:    r.FormValue("action"),
-		}
-	}
-
-	if rr.IP == "" || rr.Protocol == "" || rr.Direction == "" || rr.Action == "" {
+	var rule SavedRule
+	if err := parseJSONRequest(r, &rule); err != nil {
 		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
 			Success: false,
-			Message: "ip, protocol, direction and action parameters are required",
+			Message: fmt.Sprintf("Error parsing request: %v", err),
 		})
 		return
 	}
 
-	if rr.Port == "" {
-		rr.Port = AnyPort
+	if rule.SrcIP == "" || rule.DstIP == "" || rule.Protocol == "" {
+		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
+			Success: false,
+			Message: "src_ip, dst_ip and protocol parameters are required",
+		})
+		return
 	}
 
-	if err := firewall.RemoveRule(rr); err != nil {
+	if rule.SrcPort == "" {
+		rule.SrcPort = AnyPort
+	}
+	if rule.DstPort == "" {
+		rule.DstPort = AnyPort
+	}
+
+	if err := firewall.RemoveRule(rule); err != nil {
 		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
 			Success: false,
 			Message: fmt.Sprintf("Failed to remove rule: %v", err),
@@ -821,8 +560,8 @@ func handleRemoveRule(w http.ResponseWriter, r *http.Request) {
 
 	sendJSONResponse(w, http.StatusOK, ApiResponse{
 		Success: true,
-		Message: fmt.Sprintf("Successfully removed %s rule for %s %s traffic for IP: %s, port: %s",
-			rr.Action, rr.Direction, rr.Protocol, rr.IP, rr.Port),
+		Message: fmt.Sprintf("Successfully removed rule for traffic from %s:%s to %s:%s (%s)",
+			rule.SrcIP, rule.SrcPort, rule.DstIP, rule.DstPort, rule.Protocol),
 	})
 }
 
@@ -838,28 +577,12 @@ func handleGlobalBlock(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Enable bool `json:"enable"`
 	}
-
-	// Проверяем, является ли запрос JSON-запросом
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "application/json" {
-		if err := parseJSONRequest(r, &request); err != nil {
-			sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-				Success: false,
-				Message: fmt.Sprintf("Error parsing request: %v", err),
-			})
-			return
-		}
-	} else {
-		// Обработка form-data запросов для обратной совместимости
-		enable := r.FormValue("enable")
-		if enable == "" {
-			sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-				Success: false,
-				Message: "enable parameter is required (true/false)",
-			})
-			return
-		}
-		request.Enable = enable == "true"
+	if err := parseJSONRequest(r, &request); err != nil {
+		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
+			Success: false,
+			Message: fmt.Sprintf("Error parsing request: %v", err),
+		})
+		return
 	}
 
 	if err := firewall.SetGlobalBlock(request.Enable); err != nil {
@@ -905,28 +628,12 @@ func handleGlobalAllow(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Enable bool `json:"enable"`
 	}
-
-	// Проверяем, является ли запрос JSON-запросом
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "application/json" {
-		if err := parseJSONRequest(r, &request); err != nil {
-			sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-				Success: false,
-				Message: fmt.Sprintf("Error parsing request: %v", err),
-			})
-			return
-		}
-	} else {
-		// Обработка form-data запросов для обратной совместимости
-		enable := r.FormValue("enable")
-		if enable == "" {
-			sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-				Success: false,
-				Message: "enable parameter is required (true/false)",
-			})
-			return
-		}
-		request.Enable = enable == "true"
+	if err := parseJSONRequest(r, &request); err != nil {
+		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
+			Success: false,
+			Message: fmt.Sprintf("Error parsing request: %v", err),
+		})
+		return
 	}
 
 	if err := firewall.SetGlobalAllow(request.Enable); err != nil {
@@ -1022,13 +729,6 @@ func handleListRules(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func directionToNumber(direction string) uint8 {
-	if direction == DirectionSrc {
-		return 0
-	}
-	return 1
-}
-
 func protocolToNumber(protocol string) (uint8, error) {
 	switch protocol {
 	case ProtocolICMP:
@@ -1071,14 +771,12 @@ func numberToProtocol(num uint8) string {
 }
 
 func setupHTTPServer() {
-	// Существующие обработчики
 	http.HandleFunc("/add-rule", handleAddRule)
 	http.HandleFunc("/remove-rule", handleRemoveRule)
 	http.HandleFunc("/list-rules", handleListRules)
 	http.HandleFunc("/global-block", handleGlobalBlock)
 	http.HandleFunc("/global-allow", handleGlobalAllow)
 	http.HandleFunc("/interfaces", handleGetInterfaces)
-	http.HandleFunc("/connections", handleGetConnections)
 
 	go func() {
 		log.Printf("Starting server on %s", ServerPort)
