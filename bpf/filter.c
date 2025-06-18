@@ -17,8 +17,8 @@
 
 // New rule structure to match the JSON format
 struct rule_key {
-    __be32 src_ip;    // 0 means any source IP
-    __be32 dst_ip;    // 0 means any destination IP
+    __le32 src_ip;    // 0 means any source IP
+    __le32 dst_ip;    // 0 means any destination IP
     __u8 proto;       // protocol
     __u16 src_port;   // 0 means any source port
     __u16 dst_port;   // 0 means any destination port
