@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,26 +18,25 @@ import (
 
 // Constants
 const (
-	RulesFile      = "rules.json"
-	ServerPort     = ":8080"
-	AnyPort        = "any"
-	ProtocolICMP   = "icmp"
-	ProtocolTCP    = "tcp"
-	ProtocolUDP    = "udp"
-	ProtocolAll    = "all"
-	ActionBlock    = "block"
-	ActionAllow    = "allow"
-	HTTPMethodPost = "POST"
-	HTTPMethodGet  = "GET"
+	RulesFile    = "rules.json"
+	AnyPort      = "any"
+	ProtocolICMP = "icmp"
+	ProtocolTCP  = "tcp"
+	ProtocolUDP  = "udp"
+	ProtocolAll  = "all"
+	ActionBlock  = "block"
+	ActionAllow  = "allow"
 )
 
 // RuleKey matches the C struct rule_key
 type RuleKey struct {
-	SrcIP   uint32 `json:"src_ip"`
-	DstIP   uint32 `json:"dst_ip"`
-	Proto   uint8  `json:"proto"`
-	SrcPort uint16 `json:"src_port"`
-	DstPort uint16 `json:"dst_port"`
+	SrcIP   uint32  `json:"src_ip"`
+	DstIP   uint32  `json:"dst_ip"`
+	Proto   uint8   `json:"proto"`
+	_       byte    // padding
+	SrcPort uint16  `json:"src_port"`
+	DstPort uint16  `json:"dst_port"`
+	_       [2]byte // дополнительный padding для выравнивания до 16 байт
 }
 
 // SavedRule represents a rule as saved in JSON
@@ -57,26 +55,6 @@ type RulesFileFormat struct {
 	Rules       []SavedRule `json:"rules"`
 	GlobalBlock bool        `json:"global_block"`
 	GlobalAllow bool        `json:"global_allow"`
-}
-
-// ApiResponse is the standard API response structure
-type ApiResponse struct {
-	Success bool        `json:"success"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
-}
-
-// ListRulesResponse is the response for listing rules
-type ListRulesResponse struct {
-	GlobalBlock bool        `json:"global_block"`
-	GlobalAllow bool        `json:"global_allow"`
-	Rules       []SavedRule `json:"rules"`
-}
-
-// GlobalStatusResponse shows global rule status
-type GlobalStatusResponse struct {
-	Enabled bool   `json:"enabled"`
-	Type    string `json:"type"`
 }
 
 // Firewall holds the eBPF programs and maps
@@ -103,7 +81,6 @@ func main() {
 		log.Printf("Warning: could not load rules from file: %v", err)
 	}
 
-	setupHTTPServer()
 	waitForTermination()
 }
 
@@ -420,315 +397,6 @@ func (fw *Firewall) saveRulesToFile() error {
 	return nil
 }
 
-// Helper functions for API responses
-func sendJSONResponse(w http.ResponseWriter, status int, response interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Error encoding JSON response: %v", err)
-	}
-}
-
-func parseJSONRequest(r *http.Request, v interface{}) error {
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "application/json" {
-		decoder := json.NewDecoder(r.Body)
-		defer r.Body.Close()
-		if err := decoder.Decode(v); err != nil {
-			return fmt.Errorf("invalid JSON: %v", err)
-		}
-		return nil
-	}
-	return fmt.Errorf("content-type must be application/json")
-}
-
-// HTTP handlers
-func handleAddRule(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodPost {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	var rule SavedRule
-	if err := parseJSONRequest(r, &rule); err != nil {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Error parsing request: %v", err),
-		})
-		return
-	}
-
-	// Validate required fields
-	if rule.Interface == "" || rule.SrcIP == "" || rule.DstIP == "" || rule.Protocol == "" || rule.Action == "" {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: "interface, src_ip, dst_ip, protocol and action parameters are required",
-		})
-		return
-	}
-
-	if rule.SrcPort == "" {
-		rule.SrcPort = AnyPort
-	}
-	if rule.DstPort == "" {
-		rule.DstPort = AnyPort
-	}
-
-	if rule.Action != ActionBlock && rule.Action != ActionAllow {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: "action must be either 'block' or 'allow'",
-		})
-		return
-	}
-
-	if err := firewall.ApplyRule(rule); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to apply rule: %v", err),
-		})
-		return
-	}
-
-	if err := firewall.saveRulesToFile(); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Rule applied but failed to save: %v", err),
-		})
-		return
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: fmt.Sprintf("Successfully %sed traffic from %s:%s to %s:%s (%s) on interface %s",
-			rule.Action, rule.SrcIP, rule.SrcPort, rule.DstIP, rule.DstPort, rule.Protocol, rule.Interface),
-		Data: rule,
-	})
-}
-
-func handleRemoveRule(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodPost {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	var rule SavedRule
-	if err := parseJSONRequest(r, &rule); err != nil {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Error parsing request: %v", err),
-		})
-		return
-	}
-
-	if rule.SrcIP == "" || rule.DstIP == "" || rule.Protocol == "" {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: "src_ip, dst_ip and protocol parameters are required",
-		})
-		return
-	}
-
-	if rule.SrcPort == "" {
-		rule.SrcPort = AnyPort
-	}
-	if rule.DstPort == "" {
-		rule.DstPort = AnyPort
-	}
-
-	if err := firewall.RemoveRule(rule); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to remove rule: %v", err),
-		})
-		return
-	}
-
-	if err := firewall.saveRulesToFile(); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Rule removed but failed to save: %v", err),
-		})
-		return
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: fmt.Sprintf("Successfully removed rule for traffic from %s:%s to %s:%s (%s)",
-			rule.SrcIP, rule.SrcPort, rule.DstIP, rule.DstPort, rule.Protocol),
-	})
-}
-
-func handleGlobalBlock(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodPost {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	var request struct {
-		Enable bool `json:"enable"`
-	}
-	if err := parseJSONRequest(r, &request); err != nil {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Error parsing request: %v", err),
-		})
-		return
-	}
-
-	if err := firewall.SetGlobalBlock(request.Enable); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to set global block: %v", err),
-		})
-		return
-	}
-
-	if err := firewall.saveRulesToFile(); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Global block set but failed to save: %v", err),
-		})
-		return
-	}
-
-	status := "disabled"
-	if request.Enable {
-		status = "enabled"
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: fmt.Sprintf("Global block %s", status),
-		Data: GlobalStatusResponse{
-			Enabled: request.Enable,
-			Type:    "block",
-		},
-	})
-}
-
-func handleGlobalAllow(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodPost {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	var request struct {
-		Enable bool `json:"enable"`
-	}
-	if err := parseJSONRequest(r, &request); err != nil {
-		sendJSONResponse(w, http.StatusBadRequest, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Error parsing request: %v", err),
-		})
-		return
-	}
-
-	if err := firewall.SetGlobalAllow(request.Enable); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to set global allow: %v", err),
-		})
-		return
-	}
-
-	if err := firewall.saveRulesToFile(); err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Global allow set but failed to save: %v", err),
-		})
-		return
-	}
-
-	status := "disabled"
-	if request.Enable {
-		status = "enabled"
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: fmt.Sprintf("Global allow %s", status),
-		Data: GlobalStatusResponse{
-			Enabled: request.Enable,
-			Type:    "allow",
-		},
-	})
-}
-
-func handleGetInterfaces(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodGet {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get network interfaces: %v", err),
-		})
-		return
-	}
-
-	var result []map[string]interface{}
-	for _, iface := range interfaces {
-		result = append(result, map[string]interface{}{
-			"name":  iface.Name,
-			"is_up": iface.Flags&net.FlagUp != 0,
-		})
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: "Network interfaces retrieved successfully",
-		Data:    result,
-	})
-}
-
-func handleListRules(w http.ResponseWriter, r *http.Request) {
-	if r.Method != HTTPMethodGet {
-		sendJSONResponse(w, http.StatusMethodNotAllowed, ApiResponse{
-			Success: false,
-			Message: "Method not allowed",
-		})
-		return
-	}
-
-	rulesFile, err := firewall.loadRulesFromFile()
-	if err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, ApiResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to load rules: %v", err),
-		})
-		return
-	}
-
-	sendJSONResponse(w, http.StatusOK, ApiResponse{
-		Success: true,
-		Message: "Rules loaded successfully",
-		Data: ListRulesResponse{
-			GlobalBlock: rulesFile.GlobalBlock,
-			GlobalAllow: rulesFile.GlobalAllow,
-			Rules:       rulesFile.Rules,
-		},
-	})
-}
-
 func protocolToNumber(protocol string) (uint8, error) {
 	switch protocol {
 	case ProtocolICMP:
@@ -768,22 +436,6 @@ func numberToProtocol(num uint8) string {
 	default:
 		return fmt.Sprintf("%d", num)
 	}
-}
-
-func setupHTTPServer() {
-	http.HandleFunc("/add-rule", handleAddRule)
-	http.HandleFunc("/remove-rule", handleRemoveRule)
-	http.HandleFunc("/list-rules", handleListRules)
-	http.HandleFunc("/global-block", handleGlobalBlock)
-	http.HandleFunc("/global-allow", handleGlobalAllow)
-	http.HandleFunc("/interfaces", handleGetInterfaces)
-
-	go func() {
-		log.Printf("Starting server on %s", ServerPort)
-		if err := http.ListenAndServe(ServerPort, nil); err != nil {
-			log.Fatal(err)
-		}
-	}()
 }
 
 func waitForTermination() {
