@@ -255,8 +255,8 @@ func (fw *Firewall) RemoveRule(rule SavedRule) error {
 
 	// Create rule key
 	key := RuleKey{
-		SrcIP:   binary.LittleEndian.Uint32(srcIP),
-		DstIP:   binary.LittleEndian.Uint32(dstIP),
+		SrcIP:   binary.BigEndian.Uint32(srcIP),
+		DstIP:   binary.BigEndian.Uint32(dstIP),
 		Proto:   protoNum,
 		SrcPort: srcPort,
 		DstPort: dstPort,

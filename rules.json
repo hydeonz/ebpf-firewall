@@ -1,15 +1,15 @@
 {
   "rules": [
     {
-      "interface": "enp0s3",
-      "src_ip": "192.168.2.1",
-      "dst_ip": "192.168.3.2",
-      "protocol": "tcp",
+      "interface": "wlp3s0",
+      "src_ip": "8.8.8.8",
+      "dst_ip": "192.168.1.67",
+      "protocol": "icmp",
       "src_port": "any",
-      "dst_port": "22",
+      "dst_port": "any",
       "action": "block"
     }
   ],
-  "global_block": true,
+  "global_block": false,
   "global_allow": false
 }

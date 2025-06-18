@@ -15,21 +15,19 @@
 #define IPPROTO_UDP 17
 #define IPPROTO_ICMP 1
 
-// New rule structure to match the JSON format
 struct rule_key {
-    __le32 src_ip;    // 0 means any source IP
-    __le32 dst_ip;    // 0 means any destination IP
-    __u8 proto;       // protocol
-    __u16 src_port;   // 0 means any source port
-    __u16 dst_port;   // 0 means any destination port
+    __be32 src_ip;
+    __be32 dst_ip;
+    __u8 proto;
+    __u16 src_port;
+    __u16 dst_port;
 };
 
-// Maps for filtering
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_RULES);
     __type(key, struct rule_key);
-    __type(value, __u8); // 1 = allow, 0 = block
+    __type(value, __u8);
 } firewall_rules SEC(".maps");
 
 struct {
@@ -46,27 +44,31 @@ struct {
     __type(value, __u8);
 } global_allow SEC(".maps");
 
-static __always_inline void log_packet(__be32 saddr, __be32 daddr, __u8 proto,
-                                     __u16 sport, __u16 dport, int action, const char *reason) {
-    // Разбиваем вывод на несколько вызовов bpf_printk
-    char proto_str[8] = {0};
+static __always_inline void log_ip_port(__be32 saddr, __be32 daddr,
+                                      __u16 sport, __u16 dport) {
+    bpf_printk("IP SRC: 0x%x", saddr);
+    bpf_printk("IP DST: 0x%x", daddr);
+    bpf_printk("PORT SRC: %u", sport);
+    bpf_printk("PORT DST: %u", dport);
+}
+
+static __always_inline void log_proto(__u8 proto) {
     switch (proto) {
-        case IPPROTO_TCP: __builtin_memcpy(proto_str, "TCP", 4); break;
-        case IPPROTO_UDP: __builtin_memcpy(proto_str, "UDP", 4); break;
-        case IPPROTO_ICMP: __builtin_memcpy(proto_str, "ICMP", 5); break;
-        default: __builtin_memcpy(proto_str, "UNKN", 5); break;
+        case IPPROTO_TCP: bpf_printk("PROTO: TCP"); break;
+        case IPPROTO_UDP: bpf_printk("PROTO: UDP"); break;
+        case IPPROTO_ICMP: bpf_printk("PROTO: ICMP"); break;
+        default: bpf_printk("PROTO: UNKNOWN(%u)", proto); break;
     }
+}
 
-    // Первая строка: протокол и адреса
-    bpf_printk("FIREWALL: %s %pI4 -> %pI4", proto_str, &saddr, &daddr);
-
-    // Вторая строка: порты
-    bpf_printk("PORTS: %d -> %d", sport, dport);
-
-    // Третья строка: действие и причина
-    bpf_printk("ACTION: %s, REASON: %s",
-              action == XDP_PASS ? "ALLOW" : "BLOCK",
-              reason);
+static __always_inline void log_rule_match(const struct rule_key *rule, __u8 action) {
+    bpf_printk("MATCHED RULE:");
+    bpf_printk("SRC IP: 0x%x", rule->src_ip);
+    bpf_printk("DST IP: 0x%x", rule->dst_ip);
+    bpf_printk("PROTO: %u", rule->proto);
+    bpf_printk("SRC PORT: %u", rule->src_port);
+    bpf_printk("DST PORT: %u", rule->dst_port);
+    bpf_printk("ACTION: %s", action ? "ALLOW" : "BLOCK");
 }
 
 static __always_inline int process_packet(void *data, void *data_end) {
@@ -81,11 +83,9 @@ static __always_inline int process_packet(void *data, void *data_end) {
     if (data + sizeof(*eth) + sizeof(*ip) > data_end)
         return XDP_PASS;
 
-    // Initialize ports (0 means any port)
     __u16 src_port = 0;
     __u16 dst_port = 0;
 
-    // Check transport header only for TCP/UDP
     if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
         struct tcphdr *tcp = (void *)ip + sizeof(*ip);
         struct udphdr *udp = (void *)ip + sizeof(*ip);
@@ -99,22 +99,26 @@ static __always_inline int process_packet(void *data, void *data_end) {
     __be32 saddr = ip->saddr;
     __be32 daddr = ip->daddr;
 
-    // Check global allow (highest priority)
+    // Log packet details
+    bpf_printk("--- NEW PACKET ---");
+    log_ip_port(saddr, daddr, src_port, dst_port);
+    log_proto(ip->protocol);
+
+    // Check global policies
     __u8 key = 0;
     __u8 *global_allow_enabled = bpf_map_lookup_elem(&global_allow, &key);
     if (global_allow_enabled && *global_allow_enabled) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port, XDP_PASS, "global allow");
+        bpf_printk("GLOBAL POLICY: ALLOW");
         return XDP_PASS;
     }
 
-    // Check global block
     __u8 *global_block_enabled = bpf_map_lookup_elem(&global_block, &key);
     if (global_block_enabled && *global_block_enabled) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port, XDP_DROP, "global block");
+        bpf_printk("GLOBAL POLICY: BLOCK");
         return XDP_DROP;
     }
 
-    // Create rule keys with different combinations of wildcards
+    // Prepare rule keys
     struct rule_key exact_key = {
         .src_ip = saddr,
         .dst_ip = daddr,
@@ -182,64 +186,23 @@ static __always_inline int process_packet(void *data, void *data_end) {
     // Check rules in order of specificity
     __u8 *rule_action;
 
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &exact_key);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "exact match rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
+    #define CHECK_RULE(rule, name) \
+        rule_action = bpf_map_lookup_elem(&firewall_rules, &rule); \
+        if (rule_action) { \
+            log_rule_match(&rule, *rule_action); \
+            return *rule_action ? XDP_PASS : XDP_DROP; \
+        }
 
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_src_ip);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard src_ip rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
+    CHECK_RULE(exact_key, "exact");
+    CHECK_RULE(wildcard_src_ip, "wildcard_src_ip");
+    CHECK_RULE(wildcard_dst_ip, "wildcard_dst_ip");
+    CHECK_RULE(wildcard_src_port, "wildcard_src_port");
+    CHECK_RULE(wildcard_dst_port, "wildcard_dst_port");
+    CHECK_RULE(wildcard_both_ips, "wildcard_both_ips");
+    CHECK_RULE(wildcard_both_ports, "wildcard_both_ports");
+    CHECK_RULE(wildcard_all, "wildcard_all");
 
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_dst_ip);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard dst_ip rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
-
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_src_port);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard src_port rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
-
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_dst_port);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard dst_port rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
-
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_both_ips);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard both IPs rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
-
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_both_ports);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard both ports rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
-
-    rule_action = bpf_map_lookup_elem(&firewall_rules, &wildcard_all);
-    if (rule_action) {
-        log_packet(saddr, daddr, ip->protocol, src_port, dst_port,
-                 *rule_action ? XDP_PASS : XDP_DROP, "wildcard all rule");
-        return *rule_action ? XDP_PASS : XDP_DROP;
-    }
-
-    // If no rules matched, default action is to pass
-    log_packet(saddr, daddr, ip->protocol, src_port, dst_port, XDP_PASS, "default pass");
+    bpf_printk("NO RULE MATCHED - DEFAULT ALLOW");
     return XDP_PASS;
 }
 
@@ -247,7 +210,6 @@ SEC("xdp")
 int xdp_firewall(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
-
     return process_packet(data, data_end);
 }
 
