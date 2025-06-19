@@ -237,7 +237,7 @@ static __always_inline int process_packet(void *data, void *data_end) {
         .dst_ip = daddr,
         .proto = ip->protocol,
         .src_port = 0,
-        .dst_port = dst_port
+        .dst_port = bpf_htons(dst_port)
     };
 
     struct rule_key wildcard_dst_port = {
