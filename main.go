@@ -498,7 +498,8 @@ func protocolToNumber(protocol string) (uint8, error) {
 
 func portToNumber(port string) (uint16, error) {
 	if port == AnyPort {
-		return 0, nil
+		p, _ := strconv.ParseUint("0", 10, 16)
+		return uint16(p), nil
 	}
 	p, err := strconv.ParseUint(port, 10, 16)
 	if err != nil {
