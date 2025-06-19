@@ -63,6 +63,11 @@ type Firewall struct {
 	firewallRules *ebpf.Map
 	globalBlock   *ebpf.Map
 	globalAllow   *ebpf.Map
+	debugSrcIP    *ebpf.Map
+	debugDstIP    *ebpf.Map
+	debugProto    *ebpf.Map
+	debugSrcPort  *ebpf.Map
+	debugDstPort  *ebpf.Map
 	currentLinks  map[string]link.Link
 	rulesMutex    sync.Mutex
 }
@@ -100,6 +105,11 @@ func NewFirewall() (*Firewall, error) {
 	firewallRules := coll.Maps["firewall_rules"]
 	globalBlock := coll.Maps["global_block"]
 	globalAllow := coll.Maps["global_allow"]
+	debugSrcIP := coll.Maps["debug_src_ip"]
+	debugDstIP := coll.Maps["debug_dst_ip"]
+	debugProto := coll.Maps["debug_proto"]
+	debugSrcPort := coll.Maps["debug_src_port"]
+	debugDstPort := coll.Maps["debug_dst_port"]
 
 	if firewallRules == nil || globalBlock == nil || globalAllow == nil {
 		coll.Close()
@@ -111,6 +121,11 @@ func NewFirewall() (*Firewall, error) {
 		firewallRules: firewallRules,
 		globalBlock:   globalBlock,
 		globalAllow:   globalAllow,
+		debugSrcIP:    debugSrcIP,
+		debugDstIP:    debugDstIP,
+		debugProto:    debugProto,
+		debugSrcPort:  debugSrcPort,
+		debugDstPort:  debugDstPort,
 		currentLinks:  make(map[string]link.Link),
 	}, nil
 }
@@ -125,6 +140,70 @@ func (fw *Firewall) Close() {
 
 	// Close the eBPF collection
 	fw.collection.Close()
+}
+
+func (fw *Firewall) AddDebugValues(rule SavedRule) error {
+	// Parse source IP
+	srcIP := net.ParseIP(rule.SrcIP).To4()
+	if srcIP == nil && rule.SrcIP != "" {
+		return fmt.Errorf("invalid source IP: %s", rule.SrcIP)
+	}
+
+	// Parse destination IP
+	dstIP := net.ParseIP(rule.DstIP).To4()
+	if dstIP == nil && rule.DstIP != "" {
+		return fmt.Errorf("invalid destination IP: %s", rule.DstIP)
+	}
+
+	protoNum, err := protocolToNumber(rule.Protocol)
+	if err != nil {
+		return err
+	}
+
+	srcPort, err := portToNumber(rule.SrcPort)
+	if err != nil {
+		return err
+	}
+
+	dstPort, err := portToNumber(rule.DstPort)
+	if err != nil {
+		return err
+	}
+
+	// Add values to debug maps
+	if srcIP != nil {
+		srcIPVal := binary.BigEndian.Uint32(srcIP)
+		if err := fw.debugSrcIP.Put(srcIPVal, uint8(1)); err != nil {
+			return fmt.Errorf("failed to add src_ip to debug map: %v", err)
+		}
+	}
+
+	if dstIP != nil {
+		dstIPVal := binary.BigEndian.Uint32(dstIP)
+		if err := fw.debugDstIP.Put(dstIPVal, uint8(1)); err != nil {
+			return fmt.Errorf("failed to add dst_ip to debug map: %v", err)
+		}
+	}
+
+	if protoNum != 0 {
+		if err := fw.debugProto.Put(protoNum, uint8(1)); err != nil {
+			return fmt.Errorf("failed to add proto to debug map: %v", err)
+		}
+	}
+
+	if srcPort != 0 {
+		if err := fw.debugSrcPort.Put(srcPort, uint8(1)); err != nil {
+			return fmt.Errorf("failed to add src_port to debug map: %v", err)
+		}
+	}
+
+	if dstPort != 0 {
+		if err := fw.debugDstPort.Put(dstPort, uint8(1)); err != nil {
+			return fmt.Errorf("failed to add dst_port to debug map: %v", err)
+		}
+	}
+
+	return nil
 }
 
 func (fw *Firewall) SetGlobalBlock(enabled bool) error {
@@ -187,8 +266,8 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 
 	// Create rule key
 	key := RuleKey{
-		SrcIP:   binary.LittleEndian.Uint32(srcIP),
-		DstIP:   binary.LittleEndian.Uint32(dstIP),
+		SrcIP:   binary.BigEndian.Uint32(srcIP),
+		DstIP:   binary.BigEndian.Uint32(dstIP),
 		Proto:   protoNum,
 		SrcPort: srcPort,
 		DstPort: dstPort,
@@ -202,6 +281,11 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 
 	if err := fw.firewallRules.Put(key, value); err != nil {
 		return fmt.Errorf("failed to insert into BPF map: %v", err)
+	}
+
+	// Add debug values
+	if err := fw.AddDebugValues(rule); err != nil {
+		log.Printf("Warning: failed to add debug values: %v", err)
 	}
 
 	// Attach XDP program if not already attached
@@ -330,10 +414,10 @@ func (fw *Firewall) saveRulesToFile() error {
 
 	for iter.Next(&key, &value) {
 		srcIP := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(srcIP, key.SrcIP)
+		binary.BigEndian.PutUint32(srcIP, key.SrcIP)
 
 		dstIP := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(dstIP, key.DstIP)
+		binary.BigEndian.PutUint32(dstIP, key.DstIP)
 
 		action := ActionBlock
 		if value == 1 {
