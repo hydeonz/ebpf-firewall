@@ -108,6 +108,30 @@ static __always_inline void log_rule_match(const struct rule_key *rule, __u8 act
     bpf_printk("ACTION: %s", action ? "ALLOW" : "BLOCK");
 }
 
+static __always_inline void print_rule_bytes(const struct rule_key *rule) {
+    __u8 *p;
+
+    p = (__u8 *)&rule->src_ip;
+    bpf_printk("SRC_IP[0]: %02x", p[0]);
+    bpf_printk("SRC_IP[1]: %02x", p[1]);
+    bpf_printk("SRC_IP[2]: %02x", p[2]);
+    bpf_printk("SRC_IP[3]: %02x", p[3]);
+
+    p = (__u8 *)&rule->dst_ip;
+    bpf_printk("SRC_IP[0]: %02x", p[0]);
+    bpf_printk("SRC_IP[1]: %02x", p[1]);
+    bpf_printk("SRC_IP[2]: %02x", p[2]);
+    bpf_printk("SRC_IP[3]: %02x", p[3]);
+
+    bpf_printk("PROTO: %02x", rule->proto);
+
+    p = (__u8 *)&rule->src_port;
+    bpf_printk("SRC_PORT: %02x %02x", p[0], p[1]);
+
+    p = (__u8 *)&rule->dst_port;
+    bpf_printk("DST_PORT: %02x %02x", p[0], p[1]);
+}
+
 static __always_inline void debug_check_fields(__be32 saddr, __be32 daddr,
                                              __u8 proto, __u16 sport, __u16 dport) {
     // Проверяем каждое поле по отдельности
@@ -250,6 +274,12 @@ static __always_inline int process_packet(void *data, void *data_end) {
 
     // Check rules in order of specificity
     __u8 *rule_action;
+
+    print_rule_bytes(&exact_key);
+    print_rule_bytes(&wildcard_src_ip);
+    print_rule_bytes(&wildcard_dst_ip);
+    print_rule_bytes(&wildcard_src_port);
+    print_rule_bytes(&wildcard_dst_port);
 
     #define CHECK_RULE(rule, name) \
         rule_action = bpf_map_lookup_elem(&firewall_rules, &rule); \

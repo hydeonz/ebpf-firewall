@@ -6,7 +6,7 @@
       "dst_ip": "192.168.1.67",
       "protocol": "icmp",
       "src_port": "any",
-      "dst_port": "any",
+      "dst_port": "22",
       "action": "block"
     }
   ],
