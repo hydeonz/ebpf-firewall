@@ -53,25 +53,48 @@ static __always_inline int match_rule(__be32 src_ip, __be32 dst_ip,
         .src_port = src_port,
         .dst_port = dst_port,
         .proto = proto,
-        .padding = {0, 0, 0}  // Initialize padding
+        .padding = {0, 0, 0}
     };
 
     if (bpf_map_lookup_elem(rules_map, &key))
         return 1;
 
-    // Check wildcard matches
+    // Generate all possible wildcard combinations
     struct rule_key wildcards[] = {
-        // Full wildcard
+        // Full wildcard (only protocol)
         { .src_ip = WILDCARD, .dst_ip = WILDCARD, .src_port = WILDCARD, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
-        // IP wildcards
+
+        // Single field wildcards
         { .src_ip = src_ip, .dst_ip = WILDCARD, .src_port = WILDCARD, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
         { .src_ip = WILDCARD, .dst_ip = dst_ip, .src_port = WILDCARD, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        { .src_ip = WILDCARD, .dst_ip = WILDCARD, .src_port = src_port, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        { .src_ip = WILDCARD, .dst_ip = WILDCARD, .src_port = WILDCARD, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
+
+        // Two field wildcards
+        // IP pairs
         { .src_ip = src_ip, .dst_ip = dst_ip, .src_port = WILDCARD, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
-        // Port wildcards
+        { .src_ip = src_ip, .dst_ip = WILDCARD, .src_port = src_port, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        { .src_ip = src_ip, .dst_ip = WILDCARD, .src_port = WILDCARD, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
+        { .src_ip = WILDCARD, .dst_ip = dst_ip, .src_port = src_port, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        { .src_ip = WILDCARD, .dst_ip = dst_ip, .src_port = WILDCARD, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
+        // Port pairs
+        { .src_ip = WILDCARD, .dst_ip = WILDCARD, .src_port = src_port, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
+
+        // Three field wildcards
         { .src_ip = src_ip, .dst_ip = dst_ip, .src_port = src_port, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
         { .src_ip = src_ip, .dst_ip = dst_ip, .src_port = WILDCARD, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
-        // Protocol wildcard
-        { .src_ip = src_ip, .dst_ip = dst_ip, .src_port = src_port, .dst_port = dst_port, .proto = WILDCARD, .padding = {0, 0, 0} },
+        { .src_ip = src_ip, .dst_ip = WILDCARD, .src_port = src_port, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
+        { .src_ip = WILDCARD, .dst_ip = dst_ip, .src_port = src_port, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
+
+        // All combinations with one specific field and rest wildcards
+        // Specific src_ip only
+        { .src_ip = src_ip, .dst_ip = WILDCARD, .src_port = WILDCARD, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        // Specific dst_ip only
+        { .src_ip = WILDCARD, .dst_ip = dst_ip, .src_port = WILDCARD, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        // Specific src_port only
+        { .src_ip = WILDCARD, .dst_ip = WILDCARD, .src_port = src_port, .dst_port = WILDCARD, .proto = proto, .padding = {0, 0, 0} },
+        // Specific dst_port only
+        { .src_ip = WILDCARD, .dst_ip = WILDCARD, .src_port = WILDCARD, .dst_port = dst_port, .proto = proto, .padding = {0, 0, 0} },
     };
 
     for (int i = 0; i < sizeof(wildcards)/sizeof(wildcards[0]); i++) {

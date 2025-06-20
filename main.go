@@ -130,6 +130,8 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 			return fmt.Errorf("invalid source IP: %s", rule.SrcIP)
 		}
 		srcIP = binary.BigEndian.Uint32(ip)
+	} else {
+		srcIP = 0
 	}
 
 	// Parse destination IP
@@ -140,6 +142,8 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 			return fmt.Errorf("invalid destination IP: %s", rule.DstIP)
 		}
 		dstIP = binary.BigEndian.Uint32(ip)
+	} else {
+		dstIP = 0
 	}
 
 	protoNum, err := protocolToNumber(rule.Protocol)
