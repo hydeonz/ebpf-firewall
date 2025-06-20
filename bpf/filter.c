@@ -1,6 +1,6 @@
 /**
  * @file simple_firewall.c
- * @brief Simplified eBPF firewall with allow/block rules
+ * @brief Simplified eBPF firewall with allow/block rules and redirect
  */
 
 #include <linux/bpf.h>
@@ -42,6 +42,14 @@ struct {
     __type(key, struct rule_key);
     __type(value, __u8);
 } block_rules SEC(".maps");
+
+// Map for redirect interface (only one entry needed)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32); // interface index
+} redirect_map SEC(".maps");
 
 static __always_inline int match_rule(__be32 src_ip, __be32 dst_ip,
                                      __u16 src_port, __u16 dst_port,
@@ -145,9 +153,7 @@ int xdp_firewall(struct xdp_md *ctx) {
     if (match_rule(ip->saddr, ip->daddr, src_port, dst_port, ip->protocol, &block_rules)) {
         return XDP_DROP;
     }
-
-    // Default action if no rules matched
-    return XDP_PASS;
+    return bpf_redirect(2, 0);
 }
 
 char _license[] SEC("license") = "GPL";
