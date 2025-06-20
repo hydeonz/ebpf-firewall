@@ -129,7 +129,7 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 		if ip == nil {
 			return fmt.Errorf("invalid source IP: %s", rule.SrcIP)
 		}
-		srcIP = binary.BigEndian.Uint32(ip)
+		srcIP = binary.LittleEndian.Uint32(ip)
 	} else {
 		srcIP = 0
 	}
@@ -141,7 +141,7 @@ func (fw *Firewall) ApplyRule(rule SavedRule) error {
 		if ip == nil {
 			return fmt.Errorf("invalid destination IP: %s", rule.DstIP)
 		}
-		dstIP = binary.BigEndian.Uint32(ip)
+		dstIP = binary.LittleEndian.Uint32(ip)
 	} else {
 		dstIP = 0
 	}
@@ -215,7 +215,7 @@ func (fw *Firewall) RemoveRule(rule SavedRule) error {
 		if ip == nil {
 			return fmt.Errorf("invalid source IP: %s", rule.SrcIP)
 		}
-		srcIP = binary.BigEndian.Uint32(ip)
+		srcIP = binary.LittleEndian.Uint32(ip)
 	}
 
 	// Parse destination IP
@@ -225,7 +225,7 @@ func (fw *Firewall) RemoveRule(rule SavedRule) error {
 		if ip == nil {
 			return fmt.Errorf("invalid destination IP: %s", rule.DstIP)
 		}
-		dstIP = binary.BigEndian.Uint32(ip)
+		dstIP = binary.LittleEndian.Uint32(ip)
 	}
 
 	protoNum, err := protocolToNumber(rule.Protocol)
@@ -322,10 +322,10 @@ func (fw *Firewall) saveRulesToFile() error {
 
 	for iterAllow.Next(&key, &value) {
 		srcIP := make(net.IP, 4)
-		binary.BigEndian.PutUint32(srcIP, key.SrcIP)
+		binary.LittleEndian.PutUint32(srcIP, key.SrcIP)
 
 		dstIP := make(net.IP, 4)
-		binary.BigEndian.PutUint32(dstIP, key.DstIP)
+		binary.LittleEndian.PutUint32(dstIP, key.DstIP)
 
 		rule := SavedRule{
 			SrcIP:    srcIP.String(),
@@ -356,10 +356,10 @@ func (fw *Firewall) saveRulesToFile() error {
 	iterBlock := fw.blockRules.Iterate()
 	for iterBlock.Next(&key, &value) {
 		srcIP := make(net.IP, 4)
-		binary.BigEndian.PutUint32(srcIP, key.SrcIP)
+		binary.LittleEndian.PutUint32(srcIP, key.SrcIP)
 
 		dstIP := make(net.IP, 4)
-		binary.BigEndian.PutUint32(dstIP, key.DstIP)
+		binary.LittleEndian.PutUint32(dstIP, key.DstIP)
 
 		rule := SavedRule{
 			SrcIP:    srcIP.String(),
