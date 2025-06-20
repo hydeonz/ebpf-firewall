@@ -153,7 +153,7 @@ int xdp_firewall(struct xdp_md *ctx) {
     if (match_rule(ip->saddr, ip->daddr, src_port, dst_port, ip->protocol, &block_rules)) {
         return XDP_DROP;
     }
-    return bpf_redirect(2, 0);
+    return bpf_redirect(3, 0);
 }
 
 char _license[] SEC("license") = "GPL";
